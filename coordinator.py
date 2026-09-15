@@ -381,21 +381,24 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
         from auth import AuthError, Verifier
         verifier = Verifier(registry)
 
+        PUBLIC = {"/health", "/install.sh", "/install.ps1"}
+
         @app.middleware("http")
         async def require_signature(request: Request, call_next):
-            if request.url.path == "/health":
+            if request.url.path in PUBLIC or request.url.path.startswith("/wheels/"):
                 return await call_next(request)
             body = await request.body()
             pq = request.url.path + (f"?{request.url.query}" if request.url.query else "")
             try:
                 request.state.worker_id = verifier.verify(dict(request.headers), request.method, pq, body)
             except AuthError as e:
+                print(f"[coordinator] auth rejected {request.method} {request.url.path} from {request.headers.get('x-worker')!r}: {e}")
                 return Response(status_code=401, content=f"auth: {e}")
             return await call_next(request)
     elif token:
         @app.middleware("http")
         async def require_token(request: Request, call_next):
-            if request.url.path != "/health" and request.headers.get("x-token") != token:
+            if request.url.path not in ("/health", "/install.sh", "/install.ps1") and not request.url.path.startswith("/wheels/") and request.headers.get("x-token") != token:
                 return Response(status_code=401, content="missing or wrong X-Token")
             return await call_next(request)
 
@@ -417,6 +420,46 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     def health():
         return {"ok": True, "role": "coordinator", "version": coord.version, "done": coord.done,
                 "dataset": coord.train.dataset, "auth": "signed" if verifier else ("token" if token else "none")}
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+    def _wheel_path() -> str | None:
+        import glob as _glob
+        w = sorted(_glob.glob(os.path.join(HERE, "dist", "dgpt-*.whl")))
+        return w[-1] if w else None
+
+    def _public_base(request: Request) -> str:
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        return f"{scheme}://{request.headers.get('host', request.url.netloc)}"
+
+    def _wheel_url(request: Request) -> str:
+        p = _wheel_path()
+        return f"{_public_base(request)}/wheels/{os.path.basename(p)}" if p else "dgpt"
+
+    @app.get("/install.sh")
+    def install_sh(request: Request):
+        """The one-line installer, pointed at this coordinator's own wheel: curl -fsSL <url>/install.sh | sh"""
+        text = open(os.path.join(HERE, "install.sh")).read()
+        text = text.replace('SRC="${DGPT_SRC:-dgpt @ git+https://github.com/YOUR_ORG/distribute}"',
+                            f'SRC="${{DGPT_SRC:-{_wheel_url(request)}}}"')
+        text = text.replace("http://HOST:8000", _public_base(request))
+        return Response(content=text, media_type="text/x-shellscript")
+
+    @app.get("/install.ps1")
+    def install_ps1(request: Request):
+        text = open(os.path.join(HERE, "install.ps1")).read()
+        text = text.replace('"dgpt @ git+https://github.com/YOUR_ORG/distribute"', f'"{_wheel_url(request)}"')
+        text = text.replace("http://HOST:8000", _public_base(request))
+        return Response(content=text, media_type="text/plain")
+
+    @app.get("/wheels/{fn}")
+    def wheel(fn: str):
+        """Served under its real filename: uv/pip need the version in the name."""
+        from fastapi.responses import FileResponse
+        p = _wheel_path()
+        if not p or fn != os.path.basename(p):
+            raise HTTPException(404, f"no such wheel; current: {os.path.basename(p) if p else 'none built'}")
+        return FileResponse(p, media_type="application/zip", filename=fn)
 
     @app.get("/data/{name}/{fn}")
     def data_file(name: str, fn: str):
@@ -467,7 +510,10 @@ def parse_args(argv=None):
     ap.add_argument("--train-set", action="append", default=[], help="override TrainConfig, e.g. --train-set max_steps=3000")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume", action="store_true", help="(default when results/<run>/ckpt.pt exists)")
+    ap.add_argument("--fresh", action="store_true", help="ignore an existing checkpoint and start from version 0")
+    ap.add_argument("--with-local-worker", action="store_true", help="also run a worker on this machine against localhost (uses the GPU if there is one)")
+    ap.add_argument("--local-threads", type=int, default=4, help="CPU threads for the local worker")
     ap.add_argument("--exit-when-done", action="store_true")
     ap.add_argument("--token", default=os.environ.get("DGPT_TOKEN"), help="shared secret workers must send (X-Token); LAN/dev only")
     ap.add_argument("--auth", default=os.environ.get("DGPT_AUTH"), help="per-worker credential registry (workers.json); enables signed requests")
@@ -507,11 +553,32 @@ def main():
             sys.exit(f"{args.auth} has no workers yet: create one with --invite NAME")
     run = apply_overrides(RunConfig(run_name=args.run_name), args.set)
     train = apply_overrides(TrainConfig(), args.train_set)
-    coord = Coordinator(run, train, resume=args.resume)
+    ckpt = os.path.join(run.checkpoint_dir or os.path.join("results", run.run_name), "ckpt.pt")
+    resume = (args.resume or os.path.exists(ckpt)) and not args.fresh
+    if resume and os.path.exists(ckpt):
+        print(f"[coordinator] checkpoint found at {ckpt}: resuming (use --fresh to start over)")
+    coord = Coordinator(run, train, resume=resume)
+    with open(os.path.join(coord.out_dir, "coordinator.cmd"), "w") as f:      # so chaos.py can restart us identically
+        f.write(" ".join(sys.argv) + "\n")
     print(f"[coordinator] run={run.run_name} K={run.local_steps} total_steps={run.total_steps} shards={run.n_shards} "
           f"outer=(lr {run.outer_lr}, mu {run.outer_momentum}, nesterov {run.outer_nesterov}) delta_dtype={run.delta_dtype} "
           f"-> {coord.out_dir}")
     app = build_app(coord, args.token, registry)
+    if args.with_local_worker:
+        import subprocess
+        wcmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py"),
+                "--coordinator", f"http://127.0.0.1:{args.port}", "--name", "local", "--threads", str(args.local_threads),
+                "--out-dir", coord.out_dir]
+        if registry is not None:
+            wcmd += ["--token", registry.invite("local")]
+        elif args.token:
+            wcmd += ["--token", args.token]
+        def start_local():
+            time.sleep(3)          # let uvicorn bind first; the worker retries anyway
+            with open(os.path.join(coord.out_dir, "local_worker.out"), "a") as f:
+                subprocess.Popen(wcmd, stdout=f, stderr=subprocess.STDOUT)
+            print(f"[coordinator] local worker started (log: {coord.out_dir}/local_worker.out)")
+        threading.Thread(target=start_local, daemon=True).start()
     if registry is not None:
         print(f"[coordinator] auth: signed requests, {sum(1 for w in registry.workers.values() if not w['revoked'])} active credential(s) in {args.auth}")
     if args.exit_when_done:

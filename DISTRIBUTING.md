@@ -50,7 +50,8 @@ nodes. Exactly one inbound port on one machine must be reachable by every worker
 | Situation | What to do |
 |---|---|
 | Everyone on the same Wi-Fi / office LAN | give workers the coordinator's LAN address, e.g. `http://192.168.1.20:8000` |
-| Coordinator at home, workers anywhere | forward port 8000 on the router to the coordinator machine, or run a tunnel: `cloudflared tunnel --url http://localhost:8000` (prints a public https URL), or `ngrok http 8000` |
+| Coordinator at home, workers anywhere | forward port 8000 on the router to the coordinator machine, or run `sh tunnel.sh`: a Cloudflare quick tunnel (free, no account, no bandwidth cap; no uptime guarantee, a new URL each start, and the hostname takes ~30-60 s to appear in DNS). `TUNNEL=ngrok sh tunnel.sh` uses ngrok instead (free tier caps monthly transfer; a K=25 run moves ~800 MB) |
+| Worker machine you can SSH into (a lab server) | `ssh -N -R 8000:localhost:8000 server` from the coordinator machine; the worker there uses `--coordinator http://127.0.0.1:8000`. No third party, no cap, encrypted |
 | You have Tailscale | install it on the coordinator and on each worker; use the coordinator's Tailscale address. No port-forwarding, encrypted, and the closest thing to a "virtual LAN", but only the coordinator needs to be reachable |
 | You have an always-on server with a stable address (e.g. a lab box) | run the coordinator there; it is the natural home for it. Workers anywhere connect outbound. If its firewall blocks 8000, an SSH tunnel from the coordinator machine works: `ssh -R 8000:localhost:8000 server` exposes a coordinator running on your laptop at `server:8000` |
 

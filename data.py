@@ -17,7 +17,9 @@ import torch
 
 # Where datasets live. Repo checkout: ./data next to this file. Installed worker: $DGPT_DATA_DIR
 # (default ~/.cache/dgpt/data), filled by fetching from the coordinator on first use.
-ROOT = os.environ.get("DGPT_DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_REPO_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# repo checkout: ./data next to this file; installed package (no ./data): ~/.cache/dgpt/data
+ROOT = os.environ.get("DGPT_DATA_DIR") or (_REPO_DATA if os.path.isdir(_REPO_DATA) else os.path.expanduser("~/.cache/dgpt/data"))
 DATASET_FILES = ("meta.json", "train.bin", "val.bin")
 
 # name -> (raw file, train fraction). Splits are contiguous cuts, tokenization is a per-char lookup.

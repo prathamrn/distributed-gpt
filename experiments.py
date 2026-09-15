@@ -37,6 +37,7 @@ def exp(**kw) -> dict:
 
 
 REASONS = {
+    "smoke_local":         "Runner sanity check: 2 local workers, 40 steps. Not an experiment.",
     "diag_interleaved":    "Is the pool-vs-sync gap caused by non-IID contiguous shards? (IID shards, same everything else)",
     "diag_full_overlap":   "Does data overlap help? (no sharding; every worker samples the whole text)",
     "diag_plain_avg":      "Is DiLoCo's Nesterov outer step hurting with only 30 rounds? (plain averaging instead)",
@@ -71,6 +72,8 @@ REASONS = {
 }
 
 EXPERIMENTS = {
+    # ---- 20-second sanity check of the runner itself ----
+    "smoke_local": exp(workers=2, cpus=1.0, sets=["local_steps=5", "total_steps=40", "n_shards=2"], train=["lr=1e-3"]),
     # ---- diagnostics for the local-SGD gap (roadblocks R6) ----
     "diag_interleaved": exp(sets=["shard_mode=interleaved"]),
     "diag_full_overlap": exp(sets=["shard_mode=full"]),
@@ -165,7 +168,7 @@ def run_one(name: str, e: dict) -> dict | None:
     out_dir = f"results/{name}"
     shutil.rmtree(out_dir, ignore_errors=True); os.makedirs(out_dir, exist_ok=True)
     log = open(f"results/{name}_coord.out", "w")
-    args = [sys.executable, "coordinator.py", "--run-name", name, "--port", str(PORT), "--exit-when-done"]
+    args = [sys.executable, "coordinator.py", "--run-name", name, "--port", str(PORT), "--exit-when-done", "--fresh"]
     for s in e["sets"]:
         args += ["--set", s]
     for t in e["train"]:

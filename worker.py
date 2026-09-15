@@ -70,6 +70,7 @@ class Worker:
         self.device = pick_device(device)
         torch.set_num_threads(threads)
         self.http = requests.Session()
+        self.http.headers["ngrok-skip-browser-warning"] = "1"     # harmless elsewhere; skips ngrok's free-tier interstitial
         self.secret: bytes | None = None
         if token:
             inv = parse_invite(token)
@@ -93,6 +94,8 @@ class Worker:
         self.hb_version: int | None = None
         self.hb_have_delta = False
         self.hb_time = 0.0                 # when the last heartbeat reply arrived
+        self.registered = False
+        self.hb_thread_started = False
         self.hb_deadline = None            # local clock time when the round may close on timeout
         self.step_delay = float(os.environ.get("STEP_DELAY_S", "0"))   # debug: simulate a slow machine on the host
         self.true_bf16 = os.environ.get("TRUE_BF16", "0") == "1"       # real autocast (5x slower on CPU); default is emulation
@@ -117,15 +120,21 @@ class Worker:
         print(f"[{self.name}] {msg}", flush=True)
 
     def _retry(self, fn, what: str):
-        """Call fn() until it returns without a connection error. Exponential backoff, never gives up."""
+        """Call fn() until it succeeds. Network errors, truncated responses and 5xx (a tunnel or proxy hiccup)
+        are retried forever with exponential backoff; a 401/403 is fatal with the server's reason shown."""
         delay = 1.0
         while not self.stop.is_set():
             try:
                 return fn()
-            except (requests.ConnectionError, requests.Timeout) as e:
-                self.say(f"{what}: coordinator unreachable ({type(e).__name__}); retry in {delay:.0f}s")
-                time.sleep(delay)
-                delay = min(BACKOFF_MAX_S, delay * 2)
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else 0
+                if code in (401, 403):
+                    sys.exit(f"[{self.name}] {what}: rejected by coordinator ({code}): {e.response.text.strip()[:200]}")
+                self.say(f"{what}: HTTP {code} from coordinator/proxy; retry in {delay:.0f}s")
+            except requests.RequestException as e:          # ConnectionError, Timeout, ChunkedEncodingError, ...
+                self.say(f"{what}: {type(e).__name__}; retry in {delay:.0f}s")
+            time.sleep(delay)
+            delay = min(BACKOFF_MAX_S, delay * 2)
         return None
 
     # ---- protocol steps --------------------------------------------------------------
@@ -152,6 +161,10 @@ class Worker:
         self.run = RunConfig.from_dict(resp["run_config"])
         self.train = TrainConfig(**{k: v for k, v in resp["train_config"].items() if k in TrainConfig.__dataclass_fields__})
         self.shard, self.n_shards = resp["shard_id"], resp["n_shards"]
+        self.registered = True
+        if not self.hb_thread_started:          # keep heartbeating during the dataset download (can take minutes over a WAN)
+            self.hb_thread_started = True
+            threading.Thread(target=self.heartbeat_loop, daemon=True, name="heartbeat").start()
         if self.ds is None or self.ds.name != self.train.dataset:
             def hdrs(method: str, url: str) -> dict:
                 h = dict(self.http.headers)
@@ -180,7 +193,8 @@ class Worker:
                     self.hb_version, self.hb_have_delta, self.hb_done = d["version"], d["have_delta_from_you"], d["done"]
                     self.hb_time = time.time()
                     self.hb_deadline = self.hb_time + d["round_closes_in_s"] if d.get("round_closes_in_s") is not None else None
-                    if not d["registered"]:
+                    if not d["registered"] and self.registered:
+                        self.registered = False
                         self.need_register.set()
             except (requests.ConnectionError, requests.Timeout):
                 pass
@@ -229,10 +243,9 @@ class Worker:
     def batch(self, rng: np.random.Generator):
         bs, T = self.train.batch_size, self.train.block_size
         d = self.ds.train
-        if self.run.shard_mode == "interleaved":          # every N-th window: disjoint, but the full text's distribution
-            n_win = (len(d) - 1) // T
-            mine = np.arange(self.shard, n_win, self.n_shards)
-            starts = rng.choice(mine, size=bs) * T
+        if self.run.shard_mode == "interleaved":          # start positions congruent to shard mod N: disjoint, IID, full offset diversity
+            starts = rng.integers(0, len(d) - T - 1, size=bs)
+            starts = starts - (starts % self.n_shards) + self.shard
         elif self.run.shard_mode == "full":               # no sharding: every worker samples the whole train split (max overlap)
             starts = rng.integers(0, len(d) - T - 1, size=bs)
         else:                                             # contiguous: worker owns one slice of the text
@@ -302,8 +315,24 @@ class Worker:
 
     # ---- main loop -------------------------------------------------------------------------
     def run_forever(self):
-        self.register()
-        threading.Thread(target=self.heartbeat_loop, daemon=True, name="heartbeat").start()
+        """Never let an unexpected exception leave the worker alive-but-idle: log it and go around again."""
+        backoff = 2.0
+        while not self.stop.is_set():
+            try:
+                self._run_loop()
+                return
+            except SystemExit:
+                raise
+            except Exception:
+                import traceback
+                self.say(f"unexpected error (worker keeps going, retry in {backoff:.0f}s):\n" + traceback.format_exc().strip())
+                self.log(event="error", error=traceback.format_exc()[-500:])
+                time.sleep(backoff); backoff = min(60.0, backoff * 2)
+                self.need_register.set()
+
+    def _run_loop(self):
+        if self.run is None:
+            self.register()                   # starts the heartbeat thread itself
         waiting_since: int | None = None
         while not self.stop.is_set():
             if self.need_register.is_set():

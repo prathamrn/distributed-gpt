@@ -44,17 +44,30 @@ otherwise all but one CPU core, and exits when the run is done. Useful flags: `-
 
 ## A whole pool on one machine
 
-For experiments, run the coordinator and add worker processes on the same machine:
+For experiments, run the coordinator with a local worker and add more worker processes:
 
 ```sh
-python3 coordinator.py --run-name test --set local_steps=25 --set total_steps=3000
-python3 worker.py --name w1 --coordinator http://127.0.0.1:8000 --device cpu --threads 2   # as many as you like
+python3 coordinator.py --run-name test --with-local-worker --set local_steps=25 --set total_steps=3000
+python3 worker.py --name w2 --coordinator http://127.0.0.1:8000 --device cpu --threads 2   # as many as you like
 python3 experiments.py --list        # named experiment queues (K sweeps, worker-count sweeps, ...)
 python3 experiments.py nodes_n4      # runs the coordinator plus N local CPU worker processes, then writes evals.md
+```
+
+## Fault tolerance
+
+Workers heartbeat every 5 s; a worker silent for 15 s is reaped and its data shard freed. Stragglers upload
+partial deltas before the round deadline; stale deltas are discarded and the worker refetches. The
+coordinator checkpoints before serving each new version and **resumes automatically** when relaunched
+with the same command (`--fresh` starts over); workers retry with backoff and re-register on their own.
+`chaos.py` injects failures on a schedule against a running pool:
+
+```sh
+python3 chaos.py --run k25 --kill worker-3@60 --pause worker-1@90:20 --restart-coordinator@150
 ```
 
 ## Tests
 
 ```sh
-python3 -m pytest tests -q
+python3 -m pytest tests -q                       # merge, protocol, auth: ~1 s
+python3 -m pytest tests/test_fault_tolerance.py  # real processes: kill a worker, SIGKILL + relaunch the coordinator: ~1 min
 ```

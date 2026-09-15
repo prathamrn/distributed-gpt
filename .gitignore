@@ -19,7 +19,8 @@ data/text8/text8.zip
 results/
 
 # --- secrets and local state ---
-workers.json          # per-worker credentials (auth.py); never commit
+# per-worker credentials (auth.py); never commit
+workers.json
 *.tok
 nohup.out
 .DS_Store
@@ -38,3 +39,4 @@ qna.md
 roadblocks.md
 evals.md
 make_report.py
+

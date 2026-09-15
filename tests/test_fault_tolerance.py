@@ -1,0 +1,98 @@
+"""End-to-end fault tolerance on a free port with real coordinator/worker processes (small model, tiny run):
+  1. a worker is killed mid-run: the pool finishes without it, its shard is freed;
+  2. the coordinator is SIGKILLed mid-run and relaunched: it resumes from its checkpoint, workers reconnect,
+     the run completes, and no version regression is served.
+Takes ~30-60 s. Skipped if the small dataset is not tokenized.
+"""
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+import pytest
+import requests
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(HERE, "data", "tinyshakespeare", "train.bin")),
+                                reason="tokenize the dataset first: python3 data.py")
+
+
+def free_port() -> int:
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+
+def start_coordinator(run, port, extra=()):
+    cmd = [sys.executable, "coordinator.py", "--run-name", run, "--port", str(port), "--set", "local_steps=5",
+           "--set", "total_steps=80", "--set", "n_shards=2", "--set", "round_timeout_initial_s=20", "--exit-when-done", *extra]
+    p = subprocess.Popen(cmd, cwd=HERE, stdout=open(os.path.join(HERE, "results", f"{run}_coord.out"), "a"), stderr=subprocess.STDOUT)
+    for _ in range(60):
+        try:
+            if requests.get(f"http://127.0.0.1:{port}/health", timeout=1).ok:
+                return p
+        except requests.ConnectionError:
+            time.sleep(0.5)
+    p.kill(); raise RuntimeError("coordinator did not start")
+
+
+def start_worker(name, port):
+    return subprocess.Popen([sys.executable, "worker.py", "--name", name, "--coordinator", f"http://127.0.0.1:{port}", "--threads", "1", "--device", "cpu"],
+                            cwd=HERE, stdout=open(os.path.join(HERE, "results", f"ft_{name}.out"), "a"), stderr=subprocess.STDOUT)
+
+
+def wait_for(pred, timeout, what):
+    for _ in range(int(timeout * 2)):
+        if pred():
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def merges(run):
+    p = os.path.join(HERE, "results", run, "coordinator.jsonl")
+    if not os.path.exists(p):
+        return []
+    return [json.loads(l) for l in open(p) if '"merge"' in l]
+
+
+def test_worker_death_and_coordinator_restart():
+    run = "ft_test"
+    subprocess.run(["rm", "-rf", os.path.join(HERE, "results", run)])
+    port = free_port()
+    coord = start_coordinator(run, port, ["--fresh"])
+    w1, w2 = start_worker("ft-w1", port), start_worker("ft-w2", port)
+    try:
+        # both workers contribute
+        wait_for(lambda: len(merges(run)) >= 2, 40, "first two merges")
+        assert merges(run)[-1]["n_deltas"] == 2
+
+        # 1. kill a worker mid-run: the pool must keep merging without it and free its shard
+        w2.kill(); w2.wait()
+        n_before = len(merges(run))
+        wait_for(lambda: len(merges(run)) >= n_before + 3, 40, "merges after worker death")
+        dead = [json.loads(l) for l in open(os.path.join(HERE, "results", run, "coordinator.jsonl")) if '"worker_dead"' in l]
+        assert dead and dead[0]["worker"] == "ft-w2"
+        assert merges(run)[-1]["n_deltas"] == 1
+
+        # 2. SIGKILL the coordinator mid-run and relaunch it: it must resume, not restart from 0
+        v_before = merges(run)[-1]["version"]
+        coord.send_signal(signal.SIGKILL); coord.wait()
+        time.sleep(3)
+        coord = start_coordinator(run, port)                  # no --fresh: auto-resume from the checkpoint
+        st = requests.get(f"http://127.0.0.1:{port}/health", timeout=2).json()
+        assert st["version"] >= v_before - 1                  # at most the in-flight round is lost
+
+        # the surviving worker reconnects on its own and the run completes
+        wait_for(lambda: os.path.exists(os.path.join(HERE, "results", run, "metrics.json")), 90, "run completion after restart")
+        m = json.load(open(os.path.join(HERE, "results", run, "metrics.json")))
+        assert m["steps"] >= 80 and m["restarts"] == 1
+        versions = [r["version"] for r in merges(run)]
+        assert versions == sorted(versions), "versions must never go backwards across a restart"
+        w1.wait(timeout=30)
+        assert w1.returncode == 0
+    finally:
+        for p in (w1, w2, coord):
+            if p.poll() is None:
+                p.kill()
