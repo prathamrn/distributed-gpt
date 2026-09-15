@@ -1,0 +1,32 @@
+{
+  "worker-1": {
+    "speed_hint": "gaming-pc",
+    "cpus": 2.0,
+    "latency_ms": 20,
+    "bandwidth_mbit": 100,
+    "dtype": "float32"
+  },
+  "worker-2": {
+    "speed_hint": "office-desktop",
+    "cpus": 1.0,
+    "latency_ms": 80,
+    "bandwidth_mbit": 20,
+    "dtype": "float32"
+  },
+  "worker-3": {
+    "speed_hint": "laptop-bf16",
+    "cpus": 1.0,
+    "latency_ms": 80,
+    "jitter_ms": 20,
+    "bandwidth_mbit": 20,
+    "dtype": "bfloat16"
+  },
+  "worker-4": {
+    "speed_hint": "old-laptop-straggler",
+    "cpus": 0.25,
+    "latency_ms": 200,
+    "jitter_ms": 40,
+    "bandwidth_mbit": 10,
+    "dtype": "bfloat16"
+  }
+}

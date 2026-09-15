@@ -1,0 +1,18 @@
+{
+  "worker-1": {
+    "speed_hint": "uniform-2cpu",
+    "cpus": 2.0
+  },
+  "worker-2": {
+    "speed_hint": "uniform-2cpu",
+    "cpus": 2.0
+  },
+  "worker-3": {
+    "speed_hint": "uniform-2cpu",
+    "cpus": 2.0
+  },
+  "worker-4": {
+    "speed_hint": "uniform-2cpu",
+    "cpus": 2.0
+  }
+}
