@@ -1,6 +1,6 @@
 """Coordinator: owns the global model, runs rounds, merges deltas, checkpoints.
 
-Runs on the HOST (not in Docker). Workers connect outbound over HTTP.
+Runs on one machine; workers anywhere connect outbound to it over HTTP.
 
     python3 coordinator.py --run-name k25 --set local_steps=25 --set total_steps=3000
     python3 coordinator.py --run-name k25 --resume        # continue from results/k25/ckpt.pt

@@ -253,7 +253,7 @@ index.append((bars_fig("16_time_bytes_vs_K", "K at equal tokens (4 workers × 75
     [("Bytes moved per run", "bytes (log)", ["K=1 (theory)"] + labels, [k1_bytes] + [m["bytes_total"] for m in ms], [AXIS] + [SERIES[0]] * 3, lambda v: f"{v/1e9:.1f} GB" if v >= 1e9 else f"{v/1e6:.0f} MB", True),
      ("Wall-clock per run", "minutes", labels, [m["wall_time_s"] / 60 for m in ms], [SERIES[0]] * 3, lambda v: f"{v:.1f} min", False),
      ("Final validation loss (vs control)", "nats/char", labels, [m["val_loss"] for m in ms], [SERIES[0]] * 3, lambda v: f"{v:.3f} ({100*(v/CONTROL['val_loss_mean']-1):+.0f}%)", "dots")],
-    note="On Docker's internal network a 3.25 MB delta uploads in ~30 ms, so K does not change wall-clock here. On a 20 Mbit home uplink each upload is 1.3 s: K=5 would spend 40% of its time uploading, K=100 under 3%."),
+    note="On a loopback network a 3.25 MB delta uploads in ~30 ms, so K does not change wall-clock here. On a 20 Mbit home uplink each upload is 1.3 s: K=5 would spend 40% of its time uploading, K=100 under 3%."),
     "Time, bytes, and loss vs K. Bytes scale as 1/K exactly. Wall-clock is flat on a fast network; the note gives the home-uplink arithmetic where K decides everything."))
 
 with open(os.path.join(OUT, "README.md"), "w") as f:

@@ -1,6 +1,6 @@
 """Worker: register, fetch weights, train K steps on a shard, upload delta, repeat.
 
-Runs inside a container (env-driven, see gen_compose.py) or on the host:
+Runs on any machine (flags or env vars):
     python3 worker.py --name w1 --coordinator http://127.0.0.1:8000 --threads 2
 
 Fault handling (PRD 7.9): every request retries with exponential backoff; a stale
@@ -364,7 +364,7 @@ def main():
     ap.add_argument("--coordinator", default=env("COORDINATOR_URL", "http://127.0.0.1:8000"))
     ap.add_argument("--dtype", default=env("DTYPE", "float32"))
     ap.add_argument("--threads", type=int, default=int(env("TORCH_THREADS", "0")) or max(1, (os.cpu_count() or 2) - 1),
-                    help="CPU threads (default: all but one core; containers set TORCH_THREADS)")
+                    help="CPU threads (default: all but one core, or $TORCH_THREADS)")
     ap.add_argument("--device", default=env("DEVICE", "auto"), help="auto | cpu | cuda | mps")
     ap.add_argument("--token", default=env("DGPT_TOKEN", "") or None, help="join token if the coordinator requires one")
     ap.add_argument("--data-dir", default=None, help="where datasets are cached (default $DGPT_DATA_DIR or ./data)")

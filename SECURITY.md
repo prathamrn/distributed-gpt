@@ -23,7 +23,7 @@ protected, how, and what is deliberately not.
 
 | Mode | Flag | Use when |
 |---|---|---|
-| none | (default) | your own LAN or Docker testbed |
+| none | (default) | your own LAN or a single-machine experiment |
 | shared token | `--token XYZ` on both sides | quick experiments across the internet with people you trust; one secret for everyone, cannot revoke one person, travels in the clear |
 | per-worker signed | `--auth workers.json` on the coordinator; each donor runs `dgpt-worker --token dgpt1.<id>.<secret>` | anything public. Recommended together with TLS |
 

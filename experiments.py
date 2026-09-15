@@ -1,12 +1,13 @@
-"""Run distributed experiments back to back: host coordinator + N worker containers each.
+"""Run distributed experiments back to back: a coordinator plus N local worker processes each.
 
     python3 experiments.py --list
     python3 experiments.py diag_interleaved diag_plain_avg        # run some
     python3 experiments.py all                                    # run every experiment not yet done
     python3 experiments.py --table                                # summarize results/*/metrics.json
 
-Each experiment is a dict: workers (N), cpus per worker, coordinator --set overrides,
---train-set overrides. Results land in results/<name>/ like any other run.
+Each experiment is a dict: workers (N), threads per worker (`cpus`), device, coordinator --set
+overrides, --train-set overrides. Workers are `worker.py` subprocesses on this machine (CPU by
+default so N of them can share the box). Results land in results/<name>/ like any other run.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import time
 import requests
 
 PORT = 8000
-BASE = dict(workers=4, cpus=2.0, mem="1g", sets=["local_steps=25", "total_steps=3000", "n_shards=4"], train=["lr=4e-3"])
+BASE = dict(workers=4, cpus=2.0, device="cpu", sets=["local_steps=25", "total_steps=3000", "n_shards=4"], train=["lr=4e-3"])
 
 
 def exp(**kw) -> dict:
@@ -105,11 +106,11 @@ EXPERIMENTS = {
     "outer_mu07": exp(sets=["outer_lr=1.0", "outer_momentum=0.7"]),
     "k5_mu05":    exp(sets=["local_steps=5", "outer_lr=1.0", "outer_momentum=0.5"]),
     # ---- larger-scale run: nanoGPT's 6L/6H/384d (10.7M params), 4 workers, plain averaging ----
-    "big_k25":    exp(mem="2.5g", sets=["outer_lr=1.0", "outer_momentum=0", "round_timeout_initial_s=600"],
+    "big_k25":    exp(sets=["outer_lr=1.0", "outer_momentum=0", "round_timeout_initial_s=600"],
                       train=["dataset=text8", "lr=4e-3", "n_layer=6", "n_head=6", "n_embd=384"]),
-    "big_k100":   exp(mem="2.5g", sets=["local_steps=100", "outer_lr=1.0", "outer_momentum=0", "round_timeout_initial_s=900"],
+    "big_k100":   exp(sets=["local_steps=100", "outer_lr=1.0", "outer_momentum=0", "round_timeout_initial_s=900"],
                       train=["dataset=text8", "lr=4e-3", "n_layer=6", "n_head=6", "n_embd=384"]),
-    "big_long_k100": exp(mem="2.5g", sets=["local_steps=100", "total_steps=12000", "outer_lr=1.0", "outer_momentum=0", "round_timeout_initial_s=1200"],
+    "big_long_k100": exp(sets=["local_steps=100", "total_steps=12000", "outer_lr=1.0", "outer_momentum=0", "round_timeout_initial_s=1200"],
                          train=["dataset=text8", "lr=4e-3", "n_layer=6", "n_head=6", "n_embd=384", "max_steps=12000"]),
 }
 
@@ -133,13 +134,13 @@ SINGLE_RUNS = {
 }
 
 
-def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
-
-
-def running_containers() -> list[str]:
-    out = subprocess.run(["docker", "compose", "ps", "-q", "--status", "running"], capture_output=True, text=True).stdout
-    return [l for l in out.split() if l]
+def start_workers(n: int, threads: int, device: str, out_dir: str) -> list[subprocess.Popen]:
+    procs = []
+    for i in range(1, n + 1):
+        log = open(os.path.join(out_dir, f"worker-{i}.out"), "a")
+        procs.append(subprocess.Popen([sys.executable, "worker.py", "--name", f"worker-{i}", "--coordinator", f"http://127.0.0.1:{PORT}",
+                                       "--threads", str(threads), "--device", device, "--out-dir", out_dir], stdout=log, stderr=subprocess.STDOUT))
+    return procs
 
 
 def last_round_line(path: str) -> str:
@@ -151,25 +152,26 @@ def last_round_line(path: str) -> str:
 
 
 def run_one(name: str, e: dict) -> dict | None:
-    print(f"\n=== {name}: {e['workers']} workers x {e['cpus']} cpu, {e.get('mem','1g')} mem, sets={e['sets']} train={e['train']} ===", flush=True)
-    # last coordinator must be gone and port free
-    for _ in range(30):
+    threads = max(1, int(round(float(e.get("cpus", 2.0)))))
+    device = e.get("device", "cpu")
+    print(f"\n=== {name}: {e['workers']} workers x {threads} threads ({device}), sets={e['sets']} train={e['train']} ===", flush=True)
+    for _ in range(30):                                   # the previous coordinator must be gone and the port free
         try:
             requests.get(f"http://127.0.0.1:{PORT}/health", timeout=1); time.sleep(2)
         except requests.ConnectionError:
             break
     else:
-        sys.exit("port 8000 still busy; is an old coordinator running?")
-    sh(["python3", "gen_compose.py", "--workers", str(e["workers"]), "--cpus", str(e["cpus"]), "--mem", str(e.get("mem", "1g"))])
-    shutil.rmtree(f"results/{name}", ignore_errors=True)
+        sys.exit(f"port {PORT} still busy; is an old coordinator running?")
+    out_dir = f"results/{name}"
+    shutil.rmtree(out_dir, ignore_errors=True); os.makedirs(out_dir, exist_ok=True)
     log = open(f"results/{name}_coord.out", "w")
-    args = ["python3", "coordinator.py", "--run-name", name, "--port", str(PORT), "--exit-when-done"]
+    args = [sys.executable, "coordinator.py", "--run-name", name, "--port", str(PORT), "--exit-when-done"]
     for s in e["sets"]:
         args += ["--set", s]
     for t in e["train"]:
         args += ["--train-set", t]
     coord = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
-    for _ in range(30):
+    for _ in range(60):
         try:
             if requests.get(f"http://127.0.0.1:{PORT}/health", timeout=1).ok:
                 break
@@ -177,21 +179,21 @@ def run_one(name: str, e: dict) -> dict | None:
             time.sleep(1)
     else:
         coord.kill(); sys.exit("coordinator did not come up")
-    sh(["docker", "compose", "up", "-d", "--remove-orphans"])
+    workers = start_workers(e["workers"], threads, device, out_dir)
     t0 = time.time()
     try:
         while coord.poll() is None:
             time.sleep(15)
             print(f"  [{time.time()-t0:5.0f}s] {last_round_line(f'results/{name}_coord.out')}", flush=True)
-        for _ in range(12):                       # workers exit on their own after fetching the final weights
-            if not running_containers():
-                break
-            time.sleep(5)
-        else:
-            subprocess.run(["docker", "compose", "stop"], capture_output=True)
+        for w in workers:                                 # workers exit on their own after fetching the final weights
+            try:
+                w.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                w.kill()
     except KeyboardInterrupt:
-        print("interrupted: stopping containers and coordinator")
-        subprocess.run(["docker", "compose", "stop"], capture_output=True)
+        print("interrupted: stopping workers and coordinator")
+        for w in workers:
+            w.kill()
         coord.kill()
         raise
     mp = f"results/{name}/metrics.json"
@@ -250,7 +252,11 @@ def ledger(path: str = "evals.md"):
                      f" | {m['steps']} | {m['rounds']} | {m['bytes_total']/1e6:.0f} | {m['stale_total']} | {reason} |")
     # manual runs not in EXPERIMENTS (first two pool runs)
     extra = {"k25_uniform": "First real 4-worker run: K=25, inner lr 1e-3 (control's lr), DiLoCo outer. Missed control by 21%.",
-             "k25_lr4e-3": "Retune: inner lr 4e-3 (linear scaling), DiLoCo outer. Closed the batch-size part of the gap."}
+             "k25_lr4e-3": "Retune: inner lr 4e-3 (linear scaling), DiLoCo outer. Closed the batch-size part of the gap.",
+             "wan_docker_honeydew": "Real internet: Docker CPU worker + honeydew GPU worker via ngrok, signed auth, adaptive K, contiguous shards. Fast worker did 95% of steps on half the text.",
+             "wan_interleaved": "Same, interleaved (block-aligned) shards: fast worker cycled 7.8K fixed windows 23x.",
+             "wan_full": "Same, full random-offset sampling: the control's data path. Ties the best single machine.",
+             "mac_honeydew_big": "text8, 10.7M model: Mac GPU worker (local) + honeydew GPU via Cloudflare tunnel, adaptive K, bf16 deltas, full sampling. Within 2% of the control."}
     lines += ["", "## Earlier manual pool runs", "", "| run | val loss | vs ctrl | reason |", "|---|---|---|---|"]
     for name, reason in extra.items():
         mp = f"results/{name}/metrics.json"

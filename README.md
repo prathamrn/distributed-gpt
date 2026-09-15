@@ -42,13 +42,15 @@ otherwise all but one CPU core, and exits when the run is done. Useful flags: `-
 `--threads N`, `--name`. From a checkout: `python3 worker.py --coordinator ...`. Details in
 `DISTRIBUTING.md`.
 
-## Simulated pool on one machine
+## A whole pool on one machine
 
-`nodes.json` describes worker containers (CPU quota, netem latency, bandwidth, dtype).
+For experiments, run the coordinator and add worker processes on the same machine:
 
 ```sh
-python3 gen_compose.py && docker compose build && docker compose up -d     # workers
-python3 coordinator.py --run-name test --set local_steps=25                 # coordinator, on the host
+python3 coordinator.py --run-name test --set local_steps=25 --set total_steps=3000
+python3 worker.py --name w1 --coordinator http://127.0.0.1:8000 --device cpu --threads 2   # as many as you like
+python3 experiments.py --list        # named experiment queues (K sweeps, worker-count sweeps, ...)
+python3 experiments.py nodes_n4      # runs the coordinator plus N local CPU worker processes, then writes evals.md
 ```
 
 ## Tests
