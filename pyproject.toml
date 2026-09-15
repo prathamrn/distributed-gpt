@@ -19,8 +19,11 @@ dependencies = [
 ]
 
 [project.scripts]
-dgpt-worker = "worker:main"
-dgpt-coordinator = "coordinator:main"
+dgpt-worker = "dgpt.worker:main"
+dgpt-coordinator = "dgpt.coordinator:main"
 
 [tool.setuptools]
-py-modules = ["model", "data", "config", "merge", "protocol", "auth", "worker", "coordinator", "evaluate"]
+packages = ["dgpt"]
+
+[tool.setuptools.package-data]
+dgpt = ["install/*"]

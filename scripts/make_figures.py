@@ -1,6 +1,6 @@
 """All loss curves, grouped by the question each group answers. Writes figures/*.png + figures/README.md.
 
-    python3 make_figures.py
+    python3 scripts/make_figures.py
 """
 from __future__ import annotations
 
@@ -137,7 +137,7 @@ index.append((fig("12_text8_10M_model", "text8, 10.7M parameters: equal tokens (
 # README
 with open(os.path.join(OUT, "README.md"), "w") as f:
     f.write("# Figures\n\nEvery loss curve from the project, grouped by the question each chart answers. All Shakespeare charts share the\n"
-            "same axes (validation nats/char vs pool tokens) and the thin line marks the control (1.567). Regenerate with `python3 make_figures.py`.\n\n")
+            "same axes (validation nats/char vs pool tokens) and the thin line marks the control (1.567). Regenerate with `python3 scripts/make_figures.py`.\n\n")
     for path, what in index:
         f.write(f"## {os.path.basename(path)}\n\n![]({os.path.basename(path)})\n\n{what}\n\n")
 print("wrote figures/README.md")
@@ -258,7 +258,7 @@ index.append((bars_fig("16_time_bytes_vs_K", "K at equal tokens (4 workers × 75
 
 with open(os.path.join(OUT, "README.md"), "w") as f:
     f.write("# Figures\n\nEvery loss curve from the project, grouped by the question each chart answers. All Shakespeare charts share the\n"
-            "same axes (validation nats/char vs pool tokens) and the thin line marks the control (1.567). Regenerate with `python3 make_figures.py`.\n\n")
+            "same axes (validation nats/char vs pool tokens) and the thin line marks the control (1.567). Regenerate with `python3 scripts/make_figures.py`.\n\n")
     for path, what in index:
         f.write(f"## {os.path.basename(path)}\n\n![]({os.path.basename(path)})\n\n{what}\n\n")
 print("wrote figures/README.md")

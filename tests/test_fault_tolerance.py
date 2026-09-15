@@ -17,7 +17,7 @@ import requests
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(HERE, "data", "tinyshakespeare", "train.bin")),
-                                reason="tokenize the dataset first: python3 data.py")
+                                reason="tokenize the dataset first: python3 -m dgpt.data")
 
 
 def free_port() -> int:
@@ -25,7 +25,7 @@ def free_port() -> int:
 
 
 def start_coordinator(run, port, extra=()):
-    cmd = [sys.executable, "coordinator.py", "--run-name", run, "--port", str(port), "--set", "local_steps=5",
+    cmd = [sys.executable, "-m", "dgpt.coordinator", "--run-name", run, "--port", str(port), "--set", "local_steps=5",
            "--set", "total_steps=80", "--set", "n_shards=2", "--set", "round_timeout_initial_s=20", "--exit-when-done", *extra]
     p = subprocess.Popen(cmd, cwd=HERE, stdout=open(os.path.join(HERE, "results", f"{run}_coord.out"), "a"), stderr=subprocess.STDOUT)
     for _ in range(60):
@@ -38,7 +38,7 @@ def start_coordinator(run, port, extra=()):
 
 
 def start_worker(name, port):
-    return subprocess.Popen([sys.executable, "worker.py", "--name", name, "--coordinator", f"http://127.0.0.1:{port}", "--threads", "1", "--device", "cpu"],
+    return subprocess.Popen([sys.executable, "-m", "dgpt.worker", "--name", name, "--coordinator", f"http://127.0.0.1:{port}", "--threads", "1", "--device", "cpu"],
                             cwd=HERE, stdout=open(os.path.join(HERE, "results", f"ft_{name}.out"), "a"), stderr=subprocess.STDOUT)
 
 

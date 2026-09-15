@@ -6,13 +6,22 @@ averages the differences into the next version. Syncing every K steps instead of
 network traffic by roughly K× at a small cost in loss. Workers connect outbound only, so they need no
 open ports; the coordinator survives dead workers, stragglers, and its own restarts.
 
+## Layout
+
+| | |
+|---|---|
+| `dgpt/` | the installable package: model, data, config, merge, protocol, auth, coordinator, worker, evaluate, and the installer scripts it serves |
+| `scripts/` | things you run: the single-machine control (`baseline.py`), experiment queues, failure injection, plots, the tunnel |
+| `tests/` | unit tests for the merge math, wire format, and auth; an end-to-end fault-tolerance test |
+| `docs/` | `DISTRIBUTING.md` (running a node anywhere), `SECURITY.md` (credential model) |
+
 ## Setting up the orchestrator (coordinator)
 
 Runs on any machine every worker can reach. Needs Python 3.10+.
 
 ```sh
 pip install -e .                                   # or: uv tool install .
-python3 data.py tinyshakespeare                    # tokenize the bundled dataset (text8: download to data/text8/text8 first)
+python3 -m dgpt.data tinyshakespeare                    # tokenize the bundled dataset (text8: download to data/text8/text8 first)
 
 dgpt-coordinator --auth workers.json --invite alice   # one credential per worker; send the printed token to them
 dgpt-coordinator --auth workers.json --run-name pool1 \
@@ -24,7 +33,7 @@ dgpt-coordinator --auth workers.json --run-name pool1 \
 recipe (`dataset`, `lr`, `n_layer`, `n_embd`, ...). Drop `--auth` on a private LAN. Results, the
 per-round log, and a resumable checkpoint land in `results/<run-name>/`; restart with `--resume`.
 Only port 8000 on this machine has to be reachable (LAN address, port-forward, tunnel, or Tailscale).
-See `SECURITY.md` for the credential model.
+See `docs/SECURITY.md` for the credential model.
 
 ## Setting up a worker
 
@@ -39,18 +48,18 @@ dgpt-worker --coordinator http://HOST:8000 --token dgpt1.alice.<secret>
 
 The worker fetches the dataset from the coordinator, uses the GPU if it finds one (CUDA or Apple),
 otherwise all but one CPU core, and exits when the run is done. Useful flags: `--device cpu`,
-`--threads N`, `--name`. From a checkout: `python3 worker.py --coordinator ...`. Details in
-`DISTRIBUTING.md`.
+`--threads N`, `--name`. From a checkout: `python3 -m dgpt.worker --coordinator ...`. Details in
+`docs/DISTRIBUTING.md`.
 
 ## A whole pool on one machine
 
 For experiments, run the coordinator with a local worker and add more worker processes:
 
 ```sh
-python3 coordinator.py --run-name test --with-local-worker --set local_steps=25 --set total_steps=3000
-python3 worker.py --name w2 --coordinator http://127.0.0.1:8000 --device cpu --threads 2   # as many as you like
-python3 experiments.py --list        # named experiment queues (K sweeps, worker-count sweeps, ...)
-python3 experiments.py nodes_n4      # runs the coordinator plus N local CPU worker processes, then writes evals.md
+python3 -m dgpt.coordinator --run-name test --with-local-worker --set local_steps=25 --set total_steps=3000
+python3 -m dgpt.worker --name w2 --coordinator http://127.0.0.1:8000 --device cpu --threads 2   # as many as you like
+python3 scripts/experiments.py --list        # named experiment queues (K sweeps, worker-count sweeps, ...)
+python3 scripts/experiments.py nodes_n4      # runs the coordinator plus N local CPU worker processes, then writes evals.md
 ```
 
 ## Fault tolerance
@@ -59,10 +68,10 @@ Workers heartbeat every 5 s; a worker silent for 15 s is reaped and its data sha
 partial deltas before the round deadline; stale deltas are discarded and the worker refetches. The
 coordinator checkpoints before serving each new version and **resumes automatically** when relaunched
 with the same command (`--fresh` starts over); workers retry with backoff and re-register on their own.
-`chaos.py` injects failures on a schedule against a running pool:
+`scripts/chaos.py` injects failures on a schedule against a running pool:
 
 ```sh
-python3 chaos.py --run k25 --kill worker-3@60 --pause worker-1@90:20 --restart-coordinator@150
+python3 scripts/chaos.py --run k25 --kill worker-3@60 --pause worker-1@90:20 --restart-coordinator@150
 ```
 
 ## Tests

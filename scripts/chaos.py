@@ -1,8 +1,8 @@
 """Inject failures into a running pool on a schedule (PRD 8): kill, pause/unpause, restart workers, add a
-late joiner, restart the coordinator. Workers are local `worker.py` processes found by their --name.
+late joiner, restart the coordinator. Workers are local `dgpt.worker` processes found by their --name.
 Logs every event to results/<run>/chaos.jsonl so plots can mark them.
 
-    python3 chaos.py --run k25 --kill worker-3@60 --pause worker-1@90:20 --restart-coordinator@150 --late-join worker-5@200
+    python3 scripts/chaos.py --run k25 --kill worker-3@60 --pause worker-1@90:20 --restart-coordinator@150 --late-join worker-5@200
 
 Actions (time is seconds after chaos.py starts):
     --kill NAME@T                SIGKILL the worker (the coordinator reaps it after 15 s; its shard is freed)
@@ -16,6 +16,9 @@ Actions (time is seconds after chaos.py starts):
 from __future__ import annotations
 
 import argparse
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import json
 import os
 import signal
@@ -29,9 +32,9 @@ def sh(cmd: list[str]) -> str:
 
 
 def worker_pid(name: str) -> int | None:
-    for pid in sh(["pgrep", "-f", "worker.py"]).split():
+    for pid in sh(["pgrep", "-f", "worker"]).split():
         args = sh(["ps", "-o", "args=", "-p", pid])
-        if "worker.py" in args and f"--name {name}" in args and "chaos.py" not in args:
+        if any(k in args for k in ("dgpt.worker", "worker.py", "dgpt-worker")) and f"--name {name}" in args and "chaos" not in args:
             return int(pid)
     return None
 
@@ -41,9 +44,9 @@ def worker_cmd(pid: int) -> list[str]:
 
 
 def coordinator_pid(run: str) -> int | None:
-    for pid in sh(["pgrep", "-f", "coordinator.py"]).split():
+    for pid in sh(["pgrep", "-f", "coordinator"]).split():
         args = sh(["ps", "-o", "args=", "-p", pid])
-        if "coordinator.py" in args and f"--run-name {run}" in args and "chaos.py" not in args:
+        if any(k in args for k in ("dgpt.coordinator", "coordinator.py", "dgpt-coordinator")) and f"--run-name {run}" in args and "chaos" not in args:
             return int(pid)
     return None
 
@@ -108,7 +111,7 @@ def main():
             os.kill(pid, signal.SIGKILL); time.sleep(1)
             log("restart", name, old_pid=pid, new_pid=launch(cmd, f"{name}_restart.out"))
         elif action == "late-join":
-            cmd = [sys.executable, "worker.py", "--name", name, "--coordinator", args.coordinator, "--out-dir", out_dir]
+            cmd = [sys.executable, "-m", "dgpt.worker", "--name", name, "--coordinator", args.coordinator, "--out-dir", out_dir]
             if args.token:
                 cmd += ["--token", args.token]
             log("late-join", name, pid=launch(cmd, f"{name}.out"))
@@ -120,9 +123,8 @@ def main():
             os.kill(pid, signal.SIGKILL); log("kill-coordinator", "coordinator", pid=pid)
             time.sleep(2)
             cmd = open(cmd_file).read().split()
-            if not cmd[0].endswith("coordinator.py"):
-                cmd = cmd[1:] if cmd and cmd[0].endswith(("python3", "python")) else cmd
-            cmd = [sys.executable] + cmd if not cmd[0].endswith("python") else cmd
+            if cmd[0].endswith(("python", "python3")):
+                cmd[0] = sys.executable
             log("restart-coordinator", "coordinator", new_pid=launch(cmd, "coordinator_restart.out"), cmd=" ".join(cmd))
     print("[chaos] done", flush=True)
 

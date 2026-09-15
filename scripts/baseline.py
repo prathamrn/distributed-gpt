@@ -8,6 +8,9 @@ Everything the distributed runs are compared against comes from here. Writes:
 """
 from __future__ import annotations
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root, so `dgpt` imports work without installing
+
 import argparse
 import json
 import os
@@ -16,10 +19,10 @@ import time
 import numpy as np
 import torch
 
-from config import TrainConfig, lr_at
-from data import Dataset
-from evaluate import evaluate_full, sample
-from model import GPT
+from dgpt.config import TrainConfig, lr_at
+from dgpt.data import Dataset
+from dgpt.evaluate import evaluate_full, sample
+from dgpt.model import GPT
 
 
 def pick_device(name: str) -> str:

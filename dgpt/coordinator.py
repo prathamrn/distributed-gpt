@@ -2,8 +2,8 @@
 
 Runs on one machine; workers anywhere connect outbound to it over HTTP.
 
-    python3 coordinator.py --run-name k25 --set local_steps=25 --set total_steps=3000
-    python3 coordinator.py --run-name k25 --resume        # continue from results/k25/ckpt.pt
+    python3 -m dgpt.coordinator --run-name k25 --set local_steps=25 --set total_steps=3000
+    dgpt-coordinator --run-name k25            # same thing once installed; resumes from results/k25/ckpt.pt if present
 
 Endpoints (see protocol.py for schemas):
     POST /register     JSON  -> shard assignment + configs
@@ -29,13 +29,13 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 
-from config import RunConfig, TrainConfig
-from data import Dataset
-from evaluate import evaluate_full
-from merge import (OuterOptimizer, RoundView, adaptive_local_steps, aggregate, round_timeout,
+from dgpt.config import RunConfig, TrainConfig
+from dgpt.data import Dataset
+from dgpt.evaluate import evaluate_full
+from dgpt.merge import (OuterOptimizer, RoundView, adaptive_local_steps, aggregate, round_timeout,
                    should_close_round)
-from model import GPT
-from protocol import (DeltaMeta, DeltaResponse, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
+from dgpt.model import GPT
+from dgpt.protocol import (DeltaMeta, DeltaResponse, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
                       RegisterResponse, WeightsMeta, check_layout, config_hash, fingerprint, layout_of, pack,
                       unpack)
 
@@ -378,7 +378,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     app = FastAPI(title="decentralized-gpt coordinator")
     verifier = None
     if registry is not None:
-        from auth import AuthError, Verifier
+        from dgpt.auth import AuthError, Verifier
         verifier = Verifier(registry)
 
         PUBLIC = {"/health", "/install.sh", "/install.ps1"}
@@ -412,7 +412,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
         headers = {}
         wid = getattr(request.state, "worker_id", None)
         if wid is not None:
-            from auth import sign_body
+            from dgpt.auth import sign_body
             headers["X-Signature"] = sign_body(registry.secret_for(wid), body)
         return Response(content=body, media_type=media_type, headers=headers)
 
@@ -425,7 +425,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
 
     def _wheel_path() -> str | None:
         import glob as _glob
-        w = sorted(_glob.glob(os.path.join(HERE, "dist", "dgpt-*.whl")))
+        w = sorted(_glob.glob(os.path.join(HERE, "..", "dist", "dgpt-*.whl")) + _glob.glob(os.path.join(os.getcwd(), "dist", "dgpt-*.whl")))
         return w[-1] if w else None
 
     def _public_base(request: Request) -> str:
@@ -439,7 +439,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     @app.get("/install.sh")
     def install_sh(request: Request):
         """The one-line installer, pointed at this coordinator's own wheel: curl -fsSL <url>/install.sh | sh"""
-        text = open(os.path.join(HERE, "install.sh")).read()
+        text = open(os.path.join(HERE, "install", "install.sh")).read()
         text = text.replace('SRC="${DGPT_SRC:-dgpt @ git+https://github.com/YOUR_ORG/distribute}"',
                             f'SRC="${{DGPT_SRC:-{_wheel_url(request)}}}"')
         text = text.replace("http://HOST:8000", _public_base(request))
@@ -447,7 +447,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
 
     @app.get("/install.ps1")
     def install_ps1(request: Request):
-        text = open(os.path.join(HERE, "install.ps1")).read()
+        text = open(os.path.join(HERE, "install", "install.ps1")).read()
         text = text.replace('"dgpt @ git+https://github.com/YOUR_ORG/distribute"', f'"{_wheel_url(request)}"')
         text = text.replace("http://HOST:8000", _public_base(request))
         return Response(content=text, media_type="text/plain")
@@ -464,7 +464,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     @app.get("/data/{name}/{fn}")
     def data_file(name: str, fn: str):
         """Serve the tokenized dataset to workers that do not have it (installed donors)."""
-        from data import DATASET_FILES, _paths, ensure_dataset
+        from dgpt.data import DATASET_FILES, _paths, ensure_dataset
         if fn not in DATASET_FILES or name != coord.train.dataset:
             raise HTTPException(404, "not served")
         ensure_dataset(name)
@@ -543,7 +543,7 @@ def main():
     args = parse_args()
     registry = None
     if args.auth:
-        from auth import Registry
+        from dgpt.auth import Registry
         registry = Registry(args.auth)
         if args.invite:
             print(registry.invite(args.invite)); return
@@ -559,14 +559,14 @@ def main():
         print(f"[coordinator] checkpoint found at {ckpt}: resuming (use --fresh to start over)")
     coord = Coordinator(run, train, resume=resume)
     with open(os.path.join(coord.out_dir, "coordinator.cmd"), "w") as f:      # so chaos.py can restart us identically
-        f.write(" ".join(sys.argv) + "\n")
+        f.write(" ".join([sys.executable, "-m", "dgpt.coordinator", *sys.argv[1:]]) + "\n")
     print(f"[coordinator] run={run.run_name} K={run.local_steps} total_steps={run.total_steps} shards={run.n_shards} "
           f"outer=(lr {run.outer_lr}, mu {run.outer_momentum}, nesterov {run.outer_nesterov}) delta_dtype={run.delta_dtype} "
           f"-> {coord.out_dir}")
     app = build_app(coord, args.token, registry)
     if args.with_local_worker:
         import subprocess
-        wcmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py"),
+        wcmd = [sys.executable, "-m", "dgpt.worker",
                 "--coordinator", f"http://127.0.0.1:{args.port}", "--name", "local", "--threads", str(args.local_threads),
                 "--out-dir", coord.out_dir]
         if registry is not None:

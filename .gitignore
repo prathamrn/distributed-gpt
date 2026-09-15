@@ -38,5 +38,5 @@ WRITEUP.md
 qna.md
 roadblocks.md
 evals.md
-make_report.py
+scripts/make_report.py
 

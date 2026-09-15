@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from auth import AuthError, Registry, Verifier, parse_invite, request_headers, sign_body
+from dgpt.auth import AuthError, Registry, Verifier, parse_invite, request_headers, sign_body
 
 
 @pytest.fixture

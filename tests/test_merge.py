@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from merge import (OuterOptimizer, RoundView, adaptive_local_steps, aggregate, coordinate_median,
+from dgpt.merge import (OuterOptimizer, RoundView, adaptive_local_steps, aggregate, coordinate_median,
                    delta_of, round_timeout, should_close_round, trimmed_mean, weighted_average)
 
 

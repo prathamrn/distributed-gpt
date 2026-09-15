@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 
-from model import GPTConfig
+from dgpt.model import GPTConfig
 
 
 @dataclass

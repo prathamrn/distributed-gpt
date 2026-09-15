@@ -12,8 +12,8 @@ import math
 
 import torch
 
-from data import Dataset
-from model import GPT, GPTConfig
+from dgpt.data import Dataset
+from dgpt.model import GPT, GPTConfig
 
 
 @torch.no_grad()

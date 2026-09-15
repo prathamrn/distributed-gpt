@@ -1,7 +1,7 @@
 """Worker: register, fetch weights, train K steps on a shard, upload delta, repeat.
 
 Runs on any machine (flags or env vars):
-    python3 worker.py --name w1 --coordinator http://127.0.0.1:8000 --threads 2
+    python3 -m dgpt.worker --name w1 --coordinator http://127.0.0.1:8000 --threads 2
 
 Fault handling (PRD 7.9): every request retries with exponential backoff; a stale
 delta means "refetch and start over"; if the coordinator forgets us (restart or
@@ -22,12 +22,12 @@ import numpy as np
 import requests
 import torch
 
-from config import RunConfig, TrainConfig, lr_at
-from data import Dataset
-from merge import delta_of
-from model import GPT, GPTConfig
-from protocol import DeltaMeta, config_hash, pack, unpack
-from auth import parse_invite, request_headers, sign_body
+from dgpt.config import RunConfig, TrainConfig, lr_at
+from dgpt.data import Dataset
+from dgpt.merge import delta_of
+from dgpt.model import GPT, GPTConfig
+from dgpt.protocol import DeltaMeta, config_hash, pack, unpack
+from dgpt.auth import parse_invite, request_headers, sign_body
 
 
 class HmacAuth(requests.auth.AuthBase):
@@ -408,7 +408,7 @@ def main():
         time.sleep(args.join_delay)
     if args.data_dir:
         os.environ["DGPT_DATA_DIR"] = args.data_dir
-        import data as _data
+        import dgpt.data as _data
         _data.ROOT = args.data_dir
     w = Worker(args.name, args.coordinator, args.dtype, args.threads, args.speed_hint, args.cpus, args.malicious, args.out_dir,
                device=args.device, token=args.token)

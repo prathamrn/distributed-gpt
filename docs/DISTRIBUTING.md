@@ -31,7 +31,7 @@ tokenized dataset once (2 MB for Tiny Shakespeare, 200 MB for text8).
 ## For the host (running the coordinator)
 
 ```sh
-uv tool install dgpt-0.1.0-py3-none-any.whl          # or run from the repo: python3 coordinator.py ...
+uv tool install dgpt-0.1.0-py3-none-any.whl          # or run from the repo: python3 -m dgpt.coordinator ...
 dgpt-coordinator --auth workers.json --invite alice   # one invite token per donor; send it to them once
 dgpt-coordinator --auth workers.json --run-name pool1 --set local_steps=25 --set total_steps=3000 \
     --train-set dataset=text8 --train-set lr=4e-3
@@ -50,7 +50,7 @@ nodes. Exactly one inbound port on one machine must be reachable by every worker
 | Situation | What to do |
 |---|---|
 | Everyone on the same Wi-Fi / office LAN | give workers the coordinator's LAN address, e.g. `http://192.168.1.20:8000` |
-| Coordinator at home, workers anywhere | forward port 8000 on the router to the coordinator machine, or run `sh tunnel.sh`: a Cloudflare quick tunnel (free, no account, no bandwidth cap; no uptime guarantee, a new URL each start, and the hostname takes ~30-60 s to appear in DNS). `TUNNEL=ngrok sh tunnel.sh` uses ngrok instead (free tier caps monthly transfer; a K=25 run moves ~800 MB) |
+| Coordinator at home, workers anywhere | forward port 8000 on the router to the coordinator machine, or run `sh scripts/tunnel.sh`: a Cloudflare quick tunnel (free, no account, no bandwidth cap; no uptime guarantee, a new URL each start, and the hostname takes ~30-60 s to appear in DNS). `TUNNEL=ngrok sh scripts/tunnel.sh` uses ngrok instead (free tier caps monthly transfer; a K=25 run moves ~800 MB) |
 | Worker machine you can SSH into (a lab server) | `ssh -N -R 8000:localhost:8000 server` from the coordinator machine; the worker there uses `--coordinator http://127.0.0.1:8000`. No third party, no cap, encrypted |
 | You have Tailscale | install it on the coordinator and on each worker; use the coordinator's Tailscale address. No port-forwarding, encrypted, and the closest thing to a "virtual LAN", but only the coordinator needs to be reachable |
 | You have an always-on server with a stable address (e.g. a lab box) | run the coordinator there; it is the natural home for it. Workers anywhere connect outbound. If its firewall blocks 8000, an SSH tunnel from the coordinator machine works: `ssh -R 8000:localhost:8000 server` exposes a coordinator running on your laptop at `server:8000` |
@@ -63,12 +63,12 @@ way with `--set delta_dtype=bfloat16`). At K=25 that is ~800 MB for a whole 4-wo
 ```sh
 uv build --wheel                # -> dist/dgpt-0.1.0-py3-none-any.whl
 ```
-Put the wheel and `install.sh` / `install.ps1` anywhere workers can fetch them (a GitHub release, an S3
+Put the wheel and `dgpt/install/install.sh` / `install.ps1` anywhere workers can fetch them (a GitHub release, an S3
 bucket, the coordinator machine via `python3 -m http.server`), and set `DGPT_SRC` in the installers to
 that URL. Torch is the only large dependency (~100 MB CPU wheel; the installer picks the CPU build on
 Linux machines without an NVIDIA GPU so nobody downloads 2 GB of CUDA by accident).
 
 ## What the worker does, so you can trust it
 
-`worker.py` is ~300 lines. It registers, downloads weights, trains K steps on its assigned slice of the
-data, uploads `W_start − W_local` as raw floats (never pickles), heartbeats, and repeats. See `protocol.py` for the exact bytes on the wire.
+`dgpt/worker.py` is ~400 lines. It registers, downloads weights, trains K steps on its assigned slice of the
+data, uploads `W_start − W_local` as raw floats (never pickles), heartbeats, and repeats. See `dgpt/protocol.py` for the exact bytes on the wire.

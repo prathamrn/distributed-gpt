@@ -1,8 +1,8 @@
 """Turn JSONL training logs into figures (PRD 9, 11).
 
 Usage:
-  python3 plots.py baseline                 # control figure from results/baseline*/log.jsonl
-  python3 plots.py curves A=path/a.jsonl B=path/b.jsonl --out results/x.png --title "..."
+  python3 scripts/plots.py baseline                 # control figure from results/baseline*/log.jsonl
+  python3 scripts/plots.py curves A=path/a.jsonl B=path/b.jsonl --out results/x.png --title "..."
 
 Style follows the dataviz reference palette: categorical hues in fixed slot
 order, 2px lines, hairline solid gridlines, text in ink tokens (never the

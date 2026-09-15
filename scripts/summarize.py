@@ -1,6 +1,6 @@
 """Aggregate metrics.json files from a set of runs into one table + JSON.
 
-  python3 summarize.py results/baseline*          # prints a table, writes results/baseline_summary.json
+  python3 scripts/summarize.py results/baseline*          # prints a table, writes results/baseline_summary.json
 """
 from __future__ import annotations
 

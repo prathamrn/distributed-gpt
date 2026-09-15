@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from model import GPT, GPTConfig
-from protocol import check_layout, config_hash, fingerprint, layout_of, pack, unpack
+from dgpt.model import GPT, GPTConfig
+from dgpt.protocol import check_layout, config_hash, fingerprint, layout_of, pack, unpack
 
 
 @pytest.fixture(scope="module")

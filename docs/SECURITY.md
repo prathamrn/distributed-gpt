@@ -40,7 +40,7 @@ signed mode; its identity is the invite's id.
 
 ## What a reviewer should check
 
-- `auth.py` is ~120 lines: `sign`, `Verifier.verify`, `Registry`. Tests in `tests/test_auth.py` cover
+- `dgpt/auth.py` is ~130 lines: `sign`, `Verifier.verify`, `Registry`. Tests in `tests/test_auth.py` cover
   wrong secret, tampered body and path, replay, stale timestamp, revocation (including from another
   process), and identity binding.
 - The coordinator applies verification in one middleware for every route except `/health`, and binds
