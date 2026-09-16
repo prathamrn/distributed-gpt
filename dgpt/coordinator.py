@@ -44,7 +44,8 @@ UPLOAD_GRACE_S = 10.0     # don't close on timeout while a straggler says it is 
 
 
 class Coordinator:
-    def __init__(self, run: RunConfig, train: TrainConfig, resume: bool = False):
+    def __init__(self, run: RunConfig, train: TrainConfig, resume: bool = False, eval_device: str = "cpu"):
+        self.eval_device = eval_device       # where the per-round validation pass runs (cpu | mps | cuda); the model is moved there for it
         self.run, self.train = run, train
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
@@ -104,8 +105,18 @@ class Coordinator:
         self._log({"event": event, **kw})
 
     def _evaluate(self) -> float:
+        return self._full_eval()["val_loss"]
+
+    def _full_eval(self) -> dict:
+        """Validation on the fixed val prefix. Runs on eval_device (the 40M model takes ~80 s per pass on a laptop CPU,
+        ~15 s on its GPU); the CPU copy of the weights stays the source of truth."""
         self.model.load_state_dict(self.weights)
-        return evaluate_full(self.model, self.ds, "cpu")["val_loss"]
+        self.model.to(self.eval_device)
+        try:
+            with torch.no_grad():
+                return evaluate_full(self.model, self.ds, self.eval_device)
+        finally:
+            self.model.to("cpu")
 
     def _alive(self) -> set[str]:
         now = time.time()
@@ -233,7 +244,7 @@ class Coordinator:
             self._finish()
 
     def _finish(self) -> None:
-        m = evaluate_full(self.model, self.ds, "cpu")
+        m = self._full_eval()
         m.update({"run": self.run.run_name, "steps": self.global_step, "tokens": self.global_step * self.train.tokens_per_step,
                   "rounds": self.rounds_merged, "version": self.version, "wall_time_s": self._wall(),
                   "bytes_in": self.bytes_in, "bytes_out": self.bytes_out, "bytes_total": self.bytes_in + self.bytes_out,
@@ -567,6 +578,7 @@ def parse_args(argv=None):
     ap.add_argument("--with-local-worker", action="store_true", help="also run a worker on this machine against localhost (uses the GPU if there is one)")
     ap.add_argument("--local-threads", type=int, default=4, help="CPU threads for the local worker")
     ap.add_argument("--exit-when-done", action="store_true")
+    ap.add_argument("--eval-device", default="cpu", help="device for the coordinator's validation pass: cpu | mps | cuda")
     ap.add_argument("--token", default=os.environ.get("DGPT_TOKEN"), help="shared secret workers must send (X-Token); LAN/dev only")
     ap.add_argument("--auth", default=os.environ.get("DGPT_AUTH"), help="per-worker credential registry (workers.json); enables signed requests")
     ap.add_argument("--invite", metavar="WORKER_ID", help="with --auth: create a credential, print the invite token, exit")
@@ -609,7 +621,7 @@ def main():
     resume = (args.resume or os.path.exists(ckpt)) and not args.fresh
     if resume and os.path.exists(ckpt):
         print(f"[coordinator] checkpoint found at {ckpt}: resuming (use --fresh to start over)")
-    coord = Coordinator(run, train, resume=resume)
+    coord = Coordinator(run, train, resume=resume, eval_device=args.eval_device)
     with open(os.path.join(coord.out_dir, "coordinator.cmd"), "w") as f:      # so chaos.py can restart us identically
         f.write(" ".join([sys.executable, "-m", "dgpt.coordinator", *sys.argv[1:]]) + "\n")
     print(f"[coordinator] run={run.run_name} K={run.local_steps} total_steps={run.total_steps} shards={run.n_shards} "

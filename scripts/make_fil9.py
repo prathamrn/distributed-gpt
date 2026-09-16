@@ -27,6 +27,7 @@ RULES = [
     (re.compile(r"&[^;]*;"), " "),                              # remaining entities
 ]
 NON_AZ = re.compile(r"[^a-z]+")
+REDIRECT = re.compile(r"#redirect", re.I)
 UPPER_TO_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
@@ -40,23 +41,37 @@ def clean_record(rec: str) -> str:
     return rec[:-1]                     # chop
 
 
-def convert(src: str, dst: str) -> None:
-    # latin-1: one char per byte, exactly how the Perl original sees the file (multi-byte UTF-8 chars become spaces)
-    with open(src, "r", encoding="latin-1") as f:
-        data = f.read()
+def convert(src: str, dst: str, chunk: int = 1 << 24) -> None:
+    """Streams the 1 GB input in chunks (records end at '>'), so peak memory stays under ~100 MB."""
     out = open(dst, "w", encoding="latin-1")
     text = False
     n = 0
-    for rec in data.split(">"):          # $/ = ">" : records end at '>'
-        rec = rec + ">"
-        if "<text " in rec:
+    tail = ""
+    with open(src, "r", encoding="latin-1") as f:      # latin-1: one char per byte, exactly how the Perl original sees it
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            parts = (tail + buf).split(">")
+            tail = parts.pop()                          # incomplete last record: carry into the next chunk
+            for rec in parts:
+                rec = rec + ">"
+                if "<text " in rec:
+                    text = True
+                if REDIRECT.search(rec):
+                    text = False
+                if text:
+                    if "</text>" in rec:
+                        text = False
+                    out.write(clean_record(rec))
+                    n += 1
+    if tail:                                            # final record without a closing '>' (Perl would emit it too)
+        if "<text " in tail:
             text = True
-        if re.search(r"#redirect", rec, re.I):
+        if REDIRECT.search(tail):
             text = False
         if text:
-            if "</text>" in rec:
-                text = False
-            out.write(clean_record(rec))
+            out.write(clean_record(tail))
             n += 1
     out.close()
     print(f"wrote {dst} from {n} text records")

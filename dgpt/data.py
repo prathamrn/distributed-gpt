@@ -73,11 +73,18 @@ def prepare(name: str = DEFAULT_DATASET, force: bool = False) -> dict:
             return json.load(f)
     if not os.path.exists(p["raw"]):
         raise FileNotFoundError(f"{p['raw']} missing: download the {name} corpus first")
-    with open(p["raw"], "r", encoding="utf-8") as f:
-        text = f.read()
-    chars = sorted(set(text))
-    # vectorized lookup (100M-char corpora): map each unicode code point to its vocab index
-    codes = np.frombuffer(text.encode("utf-32-le"), dtype="<u4")
+    with open(p["raw"], "rb") as f:
+        raw = f.read()
+    if raw.isascii():
+        # pure-ASCII corpora (text8, fil9): one byte per char, so the lookup runs on the bytes directly
+        # (1 byte/char instead of the 4 bytes/char of the utf-32 path; fil9 then fits a 5 GB machine)
+        codes = np.frombuffer(raw, dtype=np.uint8)
+        chars = [chr(b) for b in np.unique(codes)]
+    else:
+        text = raw.decode("utf-8")
+        chars = sorted(set(text))
+        codes = np.frombuffer(text.encode("utf-32-le"), dtype="<u4")
+    del raw
     table = np.zeros(int(codes.max()) + 1, dtype=np.uint16)
     for i, ch in enumerate(chars):
         table[ord(ch)] = i
