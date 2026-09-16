@@ -260,7 +260,8 @@ def ledger(path: str = "evals.md"):
              "wan_docker_honeydew": "Real internet: Docker CPU worker + honeydew GPU worker via ngrok, signed auth, adaptive K, contiguous shards. Fast worker did 95% of steps on half the text.",
              "wan_interleaved": "Same, interleaved (block-aligned) shards: fast worker cycled 7.8K fixed windows 23x.",
              "wan_full": "Same, full random-offset sampling: the control's data path. Ties the best single machine.",
-             "mac_honeydew_big": "text8, 10.7M model: Mac GPU worker (local) + honeydew GPU via Cloudflare tunnel, adaptive K, bf16 deltas, full sampling. Within 2% of the control."}
+             "mac_honeydew_big": "text8, 10.7M model: Mac GPU worker (local) + honeydew GPU via Cloudflare tunnel, adaptive K, bf16 deltas, full sampling. Within 2% of the control.",
+             "pool2": "Three machines on three networks: a 2-core Ubuntu VM (started alone), honeydew GPU via Cloudflare tunnel and the Mac GPU (joined at v14). K=25, adaptive K, full sampling. +0.8% vs control, 0 stale."}
     lines += ["", "## Earlier manual pool runs", "", "| run | val loss | vs ctrl | reason |", "|---|---|---|---|"]
     for name, reason in extra.items():
         mp = f"results/{name}/metrics.json"

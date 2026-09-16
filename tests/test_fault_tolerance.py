@@ -1,8 +1,12 @@
 """End-to-end fault tolerance on a free port with real coordinator/worker processes (small model, tiny run):
   1. a worker is killed mid-run: the pool finishes without it, its shard is freed;
   2. the coordinator is SIGKILLed mid-run and relaunched: it resumes from its checkpoint, workers reconnect,
-     the run completes, and no version regression is served.
-Takes ~30-60 s. Skipped if the small dataset is not tokenized.
+     the run completes, and no version regression is served;
+  3. a worker is frozen (SIGSTOP) for longer than dead_after_s: it is declared dead, its shard freed, and it
+     re-registers by itself when it wakes;
+  4. a worker's *connection* is cut for 20 s through scripts/chaos_proxy.py: its in-flight request fails, it
+     retries with backoff, is declared dead, and rejoins when the link returns; the run completes.
+Takes ~2-3 min in total. Skipped if the small dataset is not tokenized.
 """
 import json
 import os
@@ -96,3 +100,76 @@ def test_worker_death_and_coordinator_restart():
         for p in (w1, w2, coord):
             if p.poll() is None:
                 p.kill()
+
+
+def start_worker_via(name, port, extra=()):
+    return subprocess.Popen([sys.executable, "-m", "dgpt.worker", "--name", name, "--coordinator", f"http://127.0.0.1:{port}",
+                             "--threads", "1", "--device", "cpu", *extra],
+                            cwd=HERE, stdout=open(os.path.join(HERE, "results", f"ft_{name}.out"), "a"), stderr=subprocess.STDOUT)
+
+
+def events(run, kind):
+    p = os.path.join(HERE, "results", run, "coordinator.jsonl")
+    return [json.loads(l) for l in open(p) if f'"{kind}"' in l] if os.path.exists(p) else []
+
+
+def test_paused_worker_is_reaped_and_rejoins():
+    run = "ft_pause"
+    subprocess.run(["rm", "-rf", os.path.join(HERE, "results", run)])
+    port = free_port()
+    coord = start_coordinator(run, port, ["--fresh", "--set", "total_steps=200"])
+    w1, w2 = start_worker("ft-p1", port), start_worker("ft-p2", port)
+    try:
+        wait_for(lambda: len(merges(run)) >= 2, 40, "first two merges")
+        w2.send_signal(signal.SIGSTOP)                       # frozen: no heartbeats, no training
+        wait_for(lambda: any(d["worker"] == "ft-p2" for d in events(run, "worker_dead")), 30, "ft-p2 declared dead")
+        n = len(merges(run))
+        wait_for(lambda: len(merges(run)) >= n + 2, 40, "pool continues with one worker")
+        assert merges(run)[-1]["n_deltas"] == 1
+        w2.send_signal(signal.SIGCONT)
+        regs = lambda: [r for r in events(run, "register") if r["worker"] == "ft-p2"]
+        wait_for(lambda: len(regs()) >= 2, 40, "ft-p2 re-registers after waking")
+        wait_for(lambda: os.path.exists(os.path.join(HERE, "results", run, "metrics.json")), 120, "run completion")
+        assert any(m["n_deltas"] == 2 for m in merges(run)[-6:]), "ft-p2 should contribute again after rejoining"
+    finally:
+        for p in (w1, w2, coord):
+            if p.poll() is None:
+                p.kill()
+
+
+def test_connection_cut_through_proxy():
+    run = "ft_cut"
+    subprocess.run(["rm", "-rf", os.path.join(HERE, "results", run)])
+    port, via, ctl = free_port(), free_port(), free_port()
+    coord = start_coordinator(run, port, ["--fresh", "--set", "total_steps=200"])
+    proxy = subprocess.Popen([sys.executable, "scripts/chaos_proxy.py", "--upstream", f"127.0.0.1:{port}", "--via", f"ft-c2={via}", "--control", str(ctl)],
+                             cwd=HERE, stdout=open(os.path.join(HERE, "results", "ft_proxy.out"), "a"), stderr=subprocess.STDOUT)
+    wait_for(lambda: requests.get(f"http://127.0.0.1:{ctl}/status", timeout=1).ok if _up(ctl) else False, 15, "proxy control API")
+    w1, w2 = start_worker("ft-c1", port), start_worker_via("ft-c2", via)
+    try:
+        wait_for(lambda: len(merges(run)) >= 2 and merges(run)[-1]["n_deltas"] == 2, 60, "both workers merging through the proxy")
+        st = requests.get(f"http://127.0.0.1:{ctl}/status", timeout=2).json()["ft-c2"]
+        assert st["bytes_down"] > 0 and st["bytes_up"] > 0
+        # cut the link: the in-flight request fails, retries are refused, the worker is declared dead
+        requests.get(f"http://127.0.0.1:{ctl}/set", params={"name": "ft-c2", "mode": "cut"}, timeout=2)
+        wait_for(lambda: any(d["worker"] == "ft-c2" for d in events(run, "worker_dead")), 30, "ft-c2 declared dead")
+        n = len(merges(run))
+        wait_for(lambda: len(merges(run)) >= n + 2, 40, "pool continues with one worker")
+        requests.get(f"http://127.0.0.1:{ctl}/set", params={"name": "ft-c2", "mode": "normal"}, timeout=2)
+        regs = lambda: [r for r in events(run, "register") if r["worker"] == "ft-c2"]
+        wait_for(lambda: len(regs()) >= 2, 40, "ft-c2 re-registers once the link is back")
+        wait_for(lambda: os.path.exists(os.path.join(HERE, "results", run, "metrics.json")), 120, "run completion")
+        log = open(os.path.join(HERE, "results", "ft_ft-c2.out")).read()
+        assert "retry in" in log, "the worker should have retried through the outage, not crashed"
+        assert w2.poll() is None or w2.returncode == 0
+    finally:
+        for p in (w1, w2, proxy, coord):
+            if p.poll() is None:
+                p.kill()
+
+
+def _up(port):
+    try:
+        return requests.get(f"http://127.0.0.1:{port}/status", timeout=1).ok
+    except requests.ConnectionError:
+        return False

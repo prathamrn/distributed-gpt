@@ -82,6 +82,7 @@ class RunConfig:
     reset_inner_opt: bool = False    # re-create the worker's AdamW at every round (FedAvg-style) instead of persisting it
     # rounds
     min_workers: int = 1             # a round may close on timeout only once this many deltas arrived
+    start_workers: int = 1           # start barrier: weights are not served until this many workers have registered
     round_timeout_factor: float = 1.5   # timeout = factor * median of recent full-round times
     round_timeout_floor_s: float = 5.0
     round_timeout_initial_s: float = 120.0   # before any round-time history exists

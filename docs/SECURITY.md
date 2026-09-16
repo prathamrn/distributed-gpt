@@ -38,12 +38,19 @@ dgpt-coordinator --auth workers.json --run-name pool1 ...  # normal start; refus
 rejoin after a coordinator restart and every donor needs a new invite. A worker's `--name` is ignored in
 signed mode; its identity is the invite's id.
 
+**One token, one instance.** Every registration is issued a fresh session id, and the worker sends it on
+every request (`X-Session`). If a second machine registers with the same token, the coordinator hands the
+identity to the newer instance and answers the older one's next request with `409 superseded`; that worker
+prints why and exits. Nothing is killed on the spot: the change takes effect on the old instance's next
+call. So a leaked or copied token cannot run two workers, and a donor who moves to a new machine just
+starts it there. Workers built before this change send no session id and are not fenced.
+
 ## What a reviewer should check
 
 - `dgpt/auth.py` is ~130 lines: `sign`, `Verifier.verify`, `Registry`. Tests in `tests/test_auth.py` cover
   wrong secret, tampered body and path, replay, stale timestamp, revocation (including from another
   process), and identity binding.
-- The coordinator applies verification in one middleware for every route except `/health`, and binds
+- The coordinator applies verification in one middleware for every route except the public ones (`/health`, `/install.sh`, `/install.ps1`, `/wheels/*`), and binds
   identity in each handler (`bind(...)`) plus inside `/delta` after the body is parsed.
 - The worker signs through a `requests` auth hook, so every call from `worker.py` is covered without
   each call site remembering to.

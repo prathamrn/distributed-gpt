@@ -218,6 +218,8 @@ class Coordinator:
             "steps_per_worker": {m["worker_id"]: m["n_steps"] for m in metas},
             "participants": sorted(r["participants"]), "alive": sorted(self._alive()), "close_reason": why,
             "round_wall_s": t_close - r["opened_at"], "timeout_s": self._timeout_s(),
+            "worker_timing": {w: {"steps_per_s": i["steps_per_s"], "overhead_s": i["overhead_s"], "assigned_k": i["assigned_k"]}
+                              for w, i in self.workers.items()},
             "bytes_in": self.bytes_in, "bytes_out": self.bytes_out, "bytes_total": self.bytes_in + self.bytes_out,
             "stale_total": self.stale_count, "rejected_total": self.rejected_count, "done": self.done,
         }
@@ -252,23 +254,42 @@ class Coordinator:
         with self.lock:
             prev = getattr(self, "previous_owner", {})
             old = next((s for s, o in prev.items() if o == req.worker_id), None)
+            import secrets as _secrets
+            session = _secrets.token_hex(8)
             if req.worker_id in self.workers:
                 shard = self.workers[req.worker_id]["shard"]
+                prev = self.workers[req.worker_id].get("session")
+                if prev and time.time() - self.workers[req.worker_id]["last_seen"] <= self.run.dead_after_s:
+                    # a live instance already holds this identity: the new one takes over, the old one is fenced out
+                    self._log_event("takeover", worker=req.worker_id, old_session=prev, new_session=session, version=self.version)
+                    print(f"[coordinator] {req.worker_id}: a new instance registered with the same token; the old one will be told to stop")
             else:
                 shard = self._free_shard(prefer=old)
                 self.shard_owner[shard] = req.worker_id if self.shard_owner[shard] is None else self.shard_owner[shard]
             self.workers[req.worker_id] = {
                 "shard": shard, "speed_hint": req.speed_hint, "dtype": req.dtype, "cpus": req.cpus,
                 "last_seen": time.time(), "registered_at": time.time(), "fetched_version": None,
-                "steps_per_s": None, "status": "registered", "local_step": 0,
+                "steps_per_s": None, "overhead_s": None, "served_at": None, "assigned_k": None,
+                "status": "registered", "local_step": 0, "session": session,
             }
             self._log_event("register", worker=req.worker_id, shard=shard, speed_hint=req.speed_hint, dtype=req.dtype, version=self.version)
+            if len(self.workers) >= self.run.start_workers:
+                self.cond.notify_all()            # release anyone waiting at the start barrier
+            else:
+                print(f"[coordinator] waiting for {self.run.start_workers - len(self.workers)} more worker(s) before serving weights")
             print(f"[coordinator] {req.worker_id} registered ({req.speed_hint}, {req.dtype}) -> shard {shard}")
-            return RegisterResponse(worker_id=req.worker_id, shard_id=shard, n_shards=self.run.n_shards, version=self.version,
+            return RegisterResponse(worker_id=req.worker_id, session=session, shard_id=shard, n_shards=self.run.n_shards, version=self.version,
                                     run_config=self.run.to_dict(), train_config=self.train.to_dict(), gpt_config=self.gpt_cfg)
 
     def weights_body(self, worker_id: str | None, since: int | None) -> bytes | None:
         with self.cond:
+            # start barrier: hold every weights request until start_workers have registered (long-poll style)
+            deadline = time.time() + LONG_POLL_S
+            while len(self.workers) < self.run.start_workers and not self.done:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return None                       # 204: the worker asks again; heartbeats keep it alive meanwhile
+                self.cond.wait(remaining)
             if since is not None and not self.done:
                 deadline = time.time() + LONG_POLL_S
                 while self.version <= since and not self.done:
@@ -285,7 +306,10 @@ class Coordinator:
                     self.round["opened_at"] = time.time()     # round clock starts at the first fetch, not at creation
                 self.round["participants"].add(worker_id)
                 if self.run.adaptive_k:
-                    k = adaptive_local_steps(self.run.local_steps, {w: i["steps_per_s"] for w, i in self.workers.items()}, worker_id)
+                    k = adaptive_local_steps(self.run.local_steps, {w: i["steps_per_s"] for w, i in self.workers.items()}, worker_id,
+                                             overhead_s={w: i["overhead_s"] for w, i in self.workers.items()})
+                info["served_at"] = time.time()               # the worker's cycle clock: download + train + upload
+                info["assigned_k"] = k
             meta = WeightsMeta(version=self.version, weights_hash=self.weights_hash, global_step=self.global_step,
                                n_workers_alive=max(1, len(self._alive())), local_steps=k, done=self.done,
                                dtype=self.run.weights_dtype).model_dump()
@@ -310,6 +334,7 @@ class Coordinator:
                 return DeltaResponse(status="unknown_worker", version=self.version, detail="re-register")
             info = self.workers[m.worker_id]
             info["last_seen"] = time.time()
+            self._learn_timing(info, m)
             if m.version != self.version or m.weights_hash != self.weights_hash:
                 self.stale_count += 1
                 self._log_event("stale_delta", worker=m.worker_id, delta_version=m.version, current_version=self.version, n_steps=m.n_steps)
@@ -324,14 +349,9 @@ class Coordinator:
                     self.rejected_count += 1
                     self._log_event("rejected_delta", worker=m.worker_id, version=self.version, reason=bad)
                     return DeltaResponse(status="rejected", version=self.version, detail=bad)
-            is_new = m.worker_id not in self.round["deltas"]
             self.round["deltas"][m.worker_id] = (tensors, m.model_dump())
-            if m.round_wall_s and m.n_steps > 0 and is_new:
-                info["steps_per_s"] = m.n_steps / m.round_wall_s
-                if m.n_steps >= self.run.local_steps:          # a full round: informs the timeout
-                    self.round_times.append(m.round_wall_s)
             self._log_event("delta", worker=m.worker_id, version=m.version, n_steps=m.n_steps, train_loss=m.train_loss,
-                            round_wall_s=m.round_wall_s, bytes=len(body), dtype=m.dtype)
+                            round_wall_s=m.round_wall_s, overhead_s=info["overhead_s"], bytes=len(body), dtype=m.dtype)
             return DeltaResponse(status="accepted", version=self.version)
 
     def _loss_check(self, delta: dict) -> str | None:
@@ -343,6 +363,24 @@ class Coordinator:
         if float(after) > float(base) + self.run.loss_check_margin:
             return f"held-out loss {float(base):.3f} -> {float(after):.3f} exceeds margin {self.run.loss_check_margin}"
         return None
+
+    def _learn_timing(self, info: dict, m: DeltaMeta) -> None:
+        """Per-worker speed and transfer overhead, measured on the coordinator's clock from the moment the weights
+        were served to the moment the delta arrived. Stale and partial deltas count too: the round they missed
+        is exactly when we need to learn why. Feeds adaptive K and the round timeout (see merge.adaptive_local_steps)."""
+        if not m.round_wall_s or m.n_steps <= 0 or info.get("fetched_version") != m.version or not info.get("served_at"):
+            return
+        speed = m.n_steps / m.round_wall_s
+        if m.n_steps >= 3 or not info["steps_per_s"]:      # a 1-2 step partial is too noisy to overwrite a real measurement
+            info["steps_per_s"] = speed
+        cycle = time.time() - info["served_at"]
+        overhead = max(0.0, cycle - m.round_wall_s)         # download + upload + anything that was not training
+        info["overhead_s"] = overhead if info["overhead_s"] is None else 0.5 * info["overhead_s"] + 0.5 * overhead
+        # timeout history: what this worker's full cycle takes (or would have taken, if it was cut short)
+        assigned = info.get("assigned_k") or self.run.local_steps
+        planned = info["overhead_s"] + assigned / info["steps_per_s"]
+        self.round_times.append(cycle if m.n_steps >= assigned else planned)
+        info["served_at"] = None                            # one measurement per fetch
 
     def heartbeat(self, hb: HeartbeatRequest) -> HeartbeatResponse:
         with self.lock:
@@ -363,7 +401,8 @@ class Coordinator:
                 "round": {"opened_s_ago": time.time() - self.round["opened_at"], "participants": sorted(self.round["participants"]),
                           "reported": sorted(self.round["deltas"]), "timeout_s": self._timeout_s()},
                 "workers": {w: {"shard": i["shard"], "alive": w in alive, "status": i["status"], "local_step": i["local_step"],
-                                "steps_per_s": i["steps_per_s"], "dtype": i["dtype"], "last_seen_s_ago": time.time() - i["last_seen"]}
+                                "steps_per_s": i["steps_per_s"], "overhead_s": i["overhead_s"], "assigned_k": i["assigned_k"],
+                                "dtype": i["dtype"], "last_seen_s_ago": time.time() - i["last_seen"]}
                             for w, i in self.workers.items()},
                 "shards": self.shard_owner, "bytes_in": self.bytes_in, "bytes_out": self.bytes_out,
                 "stale_total": self.stale_count, "rejected_total": self.rejected_count, "restarts": self.restarts,
@@ -407,6 +446,16 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
         wid = getattr(request.state, "worker_id", None)
         if wid is not None and claimed is not None and claimed != wid:
             raise HTTPException(403, f"message claims worker {claimed!r} but was signed by {wid!r}")
+
+    def fence(worker_id: str | None, session: str | None) -> None:
+        """A worker instance whose session was superseded by a newer registration must stop (409)."""
+        if not worker_id or not session:
+            return                                    # legacy worker without a session header: not fenced
+        with coord.lock:                              # same lock as every other read of coord.workers (RLock: handlers may hold it)
+            info = coord.workers.get(worker_id)
+            superseded = info is not None and info.get("session") and info["session"] != session
+        if superseded:
+            raise HTTPException(409, "superseded: another instance registered with this token; this one must stop")
 
     def signed(request: Request, body: bytes, media_type: str) -> Response:
         headers = {}
@@ -481,6 +530,7 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     @app.get("/weights")
     def weights(request: Request, worker_id: str | None = None, since: int | None = None):
         bind(request, worker_id)
+        fence(worker_id, request.headers.get("x-session"))
         body = coord.weights_body(worker_id, since)
         if body is None:
             return Response(status_code=204)
@@ -489,11 +539,13 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     @app.post("/delta", response_model=DeltaResponse)
     async def delta(request: Request):
         body = await request.body()
+        fence(request.headers.get("x-worker"), request.headers.get("x-session"))
         return coord.delta(body, auth_worker=getattr(request.state, "worker_id", None))
 
     @app.post("/heartbeat", response_model=HeartbeatResponse)
     def heartbeat(hb: HeartbeatRequest, request: Request):
         bind(request, hb.worker_id)
+        fence(hb.worker_id, request.headers.get("x-session"))
         return coord.heartbeat(hb)
 
     @app.get("/status")

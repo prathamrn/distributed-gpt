@@ -144,3 +144,17 @@ def test_adaptive_k():
     assert adaptive_local_steps(100, speeds, "slow") == 25
     assert adaptive_local_steps(100, speeds, "unknown") == 100
     assert adaptive_local_steps(100, {}, "fast") == 100
+
+
+def test_adaptive_k_subtracts_transfer_overhead():
+    # median worker trains K=100 at 2 steps/s = 50 s; a fast worker whose WAN transfers cost 25 s more than the
+    # median's gets 25 s less training, so its whole cycle still lands on the same target
+    speeds = {"fast": 4.0, "mid": 2.0, "slow": 0.5}
+    overhead = {"fast": 30.0, "mid": 5.0, "slow": 5.0}
+    assert adaptive_local_steps(100, speeds, "mid", overhead_s=overhead) == 100
+    assert adaptive_local_steps(100, speeds, "fast", overhead_s=overhead) == 100        # 4 * (50 + 5 - 30)
+    assert adaptive_local_steps(100, speeds, "slow", overhead_s=overhead) == 25
+    # transfers that eat the whole budget: still min_frac of the training target, never 1 step
+    assert adaptive_local_steps(100, speeds, "fast", overhead_s={"fast": 80.0, "mid": 5.0, "slow": 5.0}) == 20  # 4 * 0.1 * 50
+    # unmeasured overhead counts as zero; the PRD formula is unchanged
+    assert adaptive_local_steps(100, speeds, "fast", overhead_s={"mid": None}) == 200

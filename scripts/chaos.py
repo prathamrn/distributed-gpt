@@ -12,6 +12,19 @@ Actions (time is seconds after chaos.py starts):
     --late-join NAME@T           start a new worker NAME against --coordinator (add --token if the pool needs one)
     --restart-coordinator@T      SIGKILL the coordinator and relaunch it with the command in results/<run>/coordinator.cmd
                                  (it auto-resumes from its last checkpoint; workers reconnect on their own)
+
+Connection-level faults need the worker to talk through scripts/chaos_proxy.py (one port per worker); pass the
+proxy's control URL with --proxy and the worker's proxy NAME:
+    --cut NAME@T:DURATION        reset every open connection of NAME and refuse new ones for DURATION s
+                                 (in-flight fetch/upload fails; the worker retries with backoff; > 15 s and it is
+                                 declared dead and re-registers when the link returns)
+    --lag NAME@T:DURATION:MS     add MS milliseconds of latency to every chunk for DURATION s
+    --throttle NAME@T:DURATION:KBS  cap NAME's link at KBS kB/s for DURATION s (a slow tunnel: transfers dominate,
+                                 adaptive K should shrink its step budget rather than cut it off)
+
+    python3 scripts/chaos_proxy.py --upstream 127.0.0.1:8000 --via w1=8001 --control 8100
+    python3 -m dgpt.worker --name w1 --coordinator http://127.0.0.1:8001
+    python3 scripts/chaos.py --run k25 --proxy http://127.0.0.1:8100 --cut w1@30:20 --throttle w1@90:60:300
 """
 from __future__ import annotations
 
@@ -61,6 +74,10 @@ def main():
     ap.add_argument("--restart", action="append", default=[], metavar="NAME@T")
     ap.add_argument("--late-join", action="append", default=[], metavar="NAME@T")
     ap.add_argument("--restart-coordinator", action="append", default=[], metavar="@T")
+    ap.add_argument("--proxy", default="http://127.0.0.1:8100", help="chaos_proxy.py control URL for --cut/--lag/--throttle")
+    ap.add_argument("--cut", action="append", default=[], metavar="NAME@T:DUR")
+    ap.add_argument("--lag", action="append", default=[], metavar="NAME@T:DUR:MS")
+    ap.add_argument("--throttle", action="append", default=[], metavar="NAME@T:DUR:KBS")
     args = ap.parse_args()
 
     events = []
@@ -74,6 +91,12 @@ def main():
         n, t = spec.split("@"); events.append((float(t), "late-join", n, None))
     for spec in args.restart_coordinator:
         events.append((float(spec.lstrip("@")), "restart-coordinator", "coordinator", None))
+    for spec in args.cut:
+        n, rest = spec.split("@"); t, d = rest.split(":"); events.append((float(t), "cut", n, (float(d), None)))
+    for spec in args.lag:
+        n, rest = spec.split("@"); t, d, ms = rest.split(":"); events.append((float(t), "lag", n, (float(d), float(ms))))
+    for spec in args.throttle:
+        n, rest = spec.split("@"); t, d, kbs = rest.split(":"); events.append((float(t), "throttle", n, (float(d), float(kbs))))
     events.sort()
     if not events:
         sys.exit("nothing scheduled")
@@ -91,6 +114,16 @@ def main():
     def launch(cmd: list[str], logname: str) -> int:
         with open(os.path.join(out_dir, logname), "a") as f:
             return subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT).pid
+
+    def proxy_set(name: str, **params) -> dict | None:
+        import urllib.parse, urllib.request
+        url = f"{args.proxy.rstrip('/')}/set?" + urllib.parse.urlencode({"name": name, **params})
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            log("proxy-error", name, error=f"{type(e).__name__}: {e}", url=url)
+            return None
 
     print("[chaos] schedule: " + ", ".join(f"{a} {n}@{t:.0f}s" for t, a, n, _ in events), flush=True)
     for t, action, name, extra in events:
@@ -115,6 +148,15 @@ def main():
             if args.token:
                 cmd += ["--token", args.token]
             log("late-join", name, pid=launch(cmd, f"{name}.out"))
+        elif action in ("cut", "lag", "throttle"):
+            dur, val = extra
+            params = {"mode": "cut"} if action == "cut" else {"lag_ms": val} if action == "lag" else {"rate_kb_s": val}
+            if proxy_set(name, **params) is None:
+                continue
+            log(action, name, duration_s=dur, **({} if action == "cut" else params))
+            time.sleep(dur)
+            restore = {"mode": "normal"} if action == "cut" else {"lag_ms": 0} if action == "lag" else {"rate_kb_s": 0}
+            proxy_set(name, **restore); log(f"un{action}", name)
         elif action == "restart-coordinator":
             pid = coordinator_pid(args.run)
             cmd_file = os.path.join(out_dir, "coordinator.cmd")

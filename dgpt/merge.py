@@ -131,11 +131,26 @@ def round_timeout(recent_round_times: list[float], factor: float, floor_s: float
     return max(floor_s, factor * statistics.median(recent_round_times))
 
 
-def adaptive_local_steps(base_k: int, worker_steps_per_s: dict[str, float], worker_id: str, k_min: int = 1) -> int:
-    """K_i = K * speed_i / median_speed, so a slow worker finishes in about the same wall time (PRD 7.9)."""
+def adaptive_local_steps(base_k: int, worker_steps_per_s: dict[str, float], worker_id: str, k_min: int = 1,
+                         overhead_s: dict[str, float] | None = None, min_frac: float = 0.1) -> int:
+    """Steps for one worker this round, chosen so every worker's *cycle* (download + train + upload) lands on the
+    same target (PRD 7.9 straggler adaptation, made transfer-aware).
+
+    train_target = base_k / median_speed          seconds the median worker spends training K steps
+    cycle_target = train_target + median_overhead the median worker's whole cycle
+    budget_i     = cycle_target - overhead_i      training time left for worker i after its own transfers
+    K_i          = speed_i * budget_i
+
+    With zero overhead this is the PRD formula K * speed_i / median_speed. A worker whose transfers eat the
+    whole budget still gets `min_frac` of the training target so it keeps contributing (and keeps being measured)
+    instead of being cut to one step and arriving stale. Workers without a measured speed get base_k."""
     speeds = [s for s in worker_steps_per_s.values() if s and s > 0]
     mine = worker_steps_per_s.get(worker_id)
     if not speeds or not mine or mine <= 0:
         return base_k
-    med = statistics.median(speeds)
-    return max(k_min, int(round(base_k * mine / med)))
+    train_target = base_k / statistics.median(speeds)
+    overheads = {w: o for w, o in (overhead_s or {}).items() if o is not None and w in worker_steps_per_s}
+    med_overhead = statistics.median(overheads.values()) if overheads else 0.0
+    budget = train_target + med_overhead - overheads.get(worker_id, 0.0)
+    budget = max(budget, min_frac * train_target)
+    return max(k_min, int(round(mine * budget)))

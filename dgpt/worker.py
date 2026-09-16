@@ -108,6 +108,7 @@ class Worker:
         self.t0 = time.time()
         self.step_s = 0.5
         self.upload_s = 1.0
+        self.download_s = 0.0
 
     # ---- logging / http -----------------------------------------------------------
     def log(self, **row):
@@ -130,6 +131,8 @@ class Worker:
                 code = e.response.status_code if e.response is not None else 0
                 if code in (401, 403):
                     sys.exit(f"[{self.name}] {what}: rejected by coordinator ({code}): {e.response.text.strip()[:200]}")
+                if code == 409 and "superseded" in e.response.text:
+                    sys.exit(f"[{self.name}] stopping: another instance registered with my token (the newer one wins)")
                 self.say(f"{what}: HTTP {code} from coordinator/proxy; retry in {delay:.0f}s")
             except requests.RequestException as e:          # ConnectionError, Timeout, ChunkedEncodingError, ...
                 self.say(f"{what}: {type(e).__name__}; retry in {delay:.0f}s")
@@ -161,6 +164,8 @@ class Worker:
         self.run = RunConfig.from_dict(resp["run_config"])
         self.train = TrainConfig(**{k: v for k, v in resp["train_config"].items() if k in TrainConfig.__dataclass_fields__})
         self.shard, self.n_shards = resp["shard_id"], resp["n_shards"]
+        self.http.headers["X-Session"] = resp.get("session", "")       # fencing token; also on X-Worker for /delta
+        self.http.headers["X-Worker"] = self.name
         self.registered = True
         if not self.hb_thread_started:          # keep heartbeating during the dataset download (can take minutes over a WAN)
             self.hb_thread_started = True
@@ -188,6 +193,9 @@ class Worker:
             try:
                 r = self.http.post(f"{self.base}/heartbeat", json={"worker_id": self.name, "status": self.status,
                                                                     "local_step": self.local_step}, timeout=10)
+                if r.status_code == 409 and "superseded" in r.text:
+                    print(f"[{self.name}] stopping: another instance registered with my token (the newer one wins)", flush=True)
+                    os._exit(3)
                 if r.ok:
                     d = r.json()
                     self.hb_version, self.hb_have_delta, self.hb_done = d["version"], d["have_delta_from_you"], d["done"]
@@ -211,9 +219,11 @@ class Worker:
             r.raise_for_status()
             self._check_response_signature(r)
             return r.content
+        t = time.time()
         body = self._retry(go, "fetch weights")
         if body is None:
             return None, None
+        self.download_s = time.time() - t
         self.bytes_down += len(body)
         tensors, meta = unpack(body)
         return tensors, meta
@@ -372,10 +382,10 @@ class Worker:
             if resp is None:
                 break
             self.log(event="round", version=version, K=meta["local_steps"], n_steps=n, train_loss=mean_loss, train_s=train_s,
-                     upload_s=self.upload_s, round_s=time.time() - t_round, status=resp["status"], upload_bytes=len(body),
+                     upload_s=self.upload_s, download_s=self.download_s, round_s=time.time() - t_round, status=resp["status"], upload_bytes=len(body),
                      bytes_up=self.bytes_up, bytes_down=self.bytes_down, steps_per_s=n / train_s if train_s else None)
             self.say(f"v{version}: {n}/{meta['local_steps']} steps, loss {mean_loss:.4f}, {n/train_s:.2f} steps/s, "
-                     f"upload {len(body)/1e6:.2f}MB in {self.upload_s:.2f}s -> {resp['status']}")
+                     f"download {self.download_s:.1f}s, upload {len(body)/1e6:.2f}MB in {self.upload_s:.2f}s -> {resp['status']}")
             if resp["status"] == "accepted":
                 self.pending = (version, body); waiting_since = version
             elif resp["status"] == "unknown_worker":

@@ -38,6 +38,7 @@ class RegisterRequest(BaseModel):
 
 class RegisterResponse(BaseModel):
     worker_id: str
+    session: str = ""               # fencing token: a later registration with the same worker id supersedes this one
     shard_id: int
     n_shards: int
     version: int

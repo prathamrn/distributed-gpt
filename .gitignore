@@ -40,3 +40,9 @@ roadblocks.md
 evals.md
 scripts/make_report.py
 
+
+# --- interview study tool (generated artifact, personal) ---
+code_explorer.html
+scripts/build_explorer.py
+slides.pptx
+scripts/build_slides.py
