@@ -98,6 +98,9 @@ class Worker:
         self.hb_thread_started = False
         self.hb_deadline = None            # local clock time when the round may close on timeout
         self.step_delay = float(os.environ.get("STEP_DELAY_S", "0"))   # debug: simulate a slow machine on the host
+        # gradient accumulation: a low-memory node runs the same batch as micro-batches of this size (0 = whole batch).
+        # Same tokens per step, same gradient (up to fp rounding), so the coordinator sees an identical contribution.
+        self.micro_batch = int(os.environ.get("MICRO_BATCH", "0"))
         self.true_bf16 = os.environ.get("TRUE_BF16", "0") == "1"       # real autocast (5x slower on CPU); default is emulation
         self.upload_done_time = 0.0
         self.hb_done = False
@@ -301,10 +304,17 @@ class Worker:
             for g in self.opt.param_groups:
                 g["lr"] = lr
             x, y = self.batch(rng)
-            with torch.autocast(self.device if self.device != "mps" else "cpu", dtype=torch.bfloat16, enabled=use_bf16):
-                _, loss = self.model(x, y)
             self.opt.zero_grad(set_to_none=True)
-            loss.backward()
+            bs = x.shape[0]
+            mb = self.micro_batch if 0 < self.micro_batch < bs else bs
+            loss_total = 0.0
+            for j in range(0, bs, mb):
+                xj, yj = x[j:j + mb], y[j:j + mb]
+                with torch.autocast(self.device if self.device != "mps" else "cpu", dtype=torch.bfloat16, enabled=use_bf16):
+                    _, loss_j = self.model(xj, yj)
+                (loss_j * (xj.shape[0] / bs)).backward()          # mean over the whole batch, accumulated per micro-batch
+                loss_total += loss_j.item() * xj.shape[0] / bs
+            loss = torch.tensor(loss_total)
             if self.train.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train.grad_clip)
             self.opt.step()
@@ -412,6 +422,8 @@ def main():
     ap.add_argument("--join-delay", type=float, default=float(env("JOIN_DELAY_S", "0")))
     ap.add_argument("--malicious", action="store_true", default=env("MALICIOUS", "0") == "1")
     ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--micro-batch", type=int, default=int(env("MICRO_BATCH", "0")),
+                    help="gradient-accumulation micro-batch size for low-memory nodes (0 = whole batch)")
     args = ap.parse_args()
     if args.join_delay > 0:
         print(f"[{args.name}] joining late: sleeping {args.join_delay}s", flush=True)
@@ -420,6 +432,7 @@ def main():
         os.environ["DGPT_DATA_DIR"] = args.data_dir
         import dgpt.data as _data
         _data.ROOT = args.data_dir
+    os.environ["MICRO_BATCH"] = str(args.micro_batch)
     w = Worker(args.name, args.coordinator, args.dtype, args.threads, args.speed_hint, args.cpus, args.malicious, args.out_dir,
                device=args.device, token=args.token)
     w.say(f"starting: coordinator={args.coordinator} device={w.device} dtype={args.dtype} threads={args.threads}" + (" MALICIOUS" if args.malicious else ""))
