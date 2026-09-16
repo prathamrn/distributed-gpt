@@ -399,7 +399,11 @@ class Coordinator:
             if info is None:
                 return HeartbeatResponse(ok=True, version=self.version, have_delta_from_you=False, registered=False, done=self.done)
             info["last_seen"] = time.time(); info["status"] = hb.status; info["local_step"] = hb.local_step
-            closes_in = max(0.0, self._timeout_s() - (time.time() - self.round["opened_at"]))
+            # no deadline until someone has fetched this version: the round clock starts at the first fetch, and a
+            # deadline computed before that (e.g. while workers wait at the start barrier) would be stale and cut
+            # the first worker off after one step
+            closes_in = (max(0.0, self._timeout_s() - (time.time() - self.round["opened_at"]))
+                         if self.round["participants"] else None)
             return HeartbeatResponse(ok=True, version=self.version, have_delta_from_you=hb.worker_id in self.round["deltas"],
                                      registered=True, done=self.done, round_closes_in_s=closes_in)
 

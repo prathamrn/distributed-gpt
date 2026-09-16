@@ -97,6 +97,7 @@ class Worker:
         self.registered = False
         self.hb_thread_started = False
         self.hb_deadline = None            # local clock time when the round may close on timeout
+        self.fetch_time = 0.0
         self.step_delay = float(os.environ.get("STEP_DELAY_S", "0"))   # debug: simulate a slow machine on the host
         # gradient accumulation: a low-memory node runs the same batch as micro-batches of this size (0 = whole batch).
         # Same tokens per step, same gradient (up to fp rounding), so the coordinator sees an identical contribution.
@@ -227,6 +228,8 @@ class Worker:
         if body is None:
             return None, None
         self.download_s = time.time() - t
+        self.fetch_time = time.time()
+        self.hb_deadline = None                 # any deadline heard before this fetch belonged to an older round clock
         self.bytes_down += len(body)
         tensors, meta = unpack(body)
         return tensors, meta
@@ -293,7 +296,7 @@ class Worker:
                 self.say(f"round v{version} already closed (coordinator at v{self.hb_version}); stopping after {n} steps")
                 break
             # ... or learns the round is about to close: stop early and upload a partial delta in time
-            if n > 0 and self.hb_deadline is not None and self.hb_version == version:
+            if n > 0 and self.hb_deadline is not None and self.hb_version == version and self.hb_time > self.fetch_time:
                 remaining = self.hb_deadline - time.time()
                 if remaining < 2 * self.step_s + self.upload_s + 1.0:
                     self.say(f"round v{version} closes in {remaining:.1f}s; uploading partial delta after {n}/{K} steps")

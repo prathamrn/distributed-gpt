@@ -103,3 +103,13 @@ def test_tiny_partial_does_not_overwrite_a_real_speed(coord):
     m = fetch(c, "w"); clock.t += 1
     assert send(c, "w", m, 1, 0.01) == "accepted"
     assert c.workers["w"]["steps_per_s"] == 10
+
+
+def test_no_deadline_before_the_first_fetch(coord):
+    from dgpt.protocol import HeartbeatRequest
+    c = coord
+    register(c, "w")
+    c.clock.t += 1000                                                       # long wait at a start barrier
+    assert c.heartbeat(HeartbeatRequest(worker_id="w")).round_closes_in_s is None
+    fetch(c, "w")
+    assert c.heartbeat(HeartbeatRequest(worker_id="w")).round_closes_in_s == pytest.approx(90.0)   # initial timeout from the fetch
