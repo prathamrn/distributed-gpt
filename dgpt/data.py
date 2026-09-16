@@ -26,6 +26,7 @@ DATASET_FILES = ("meta.json", "train.bin", "val.bin")
 DATASETS = {
     "tinyshakespeare": {"raw": "input.txt", "train_frac": 0.9},
     "text8": {"raw": "text8", "train_frac": 0.9},       # 100M chars of Wikipedia, vocab 27; 90M train / 10M val
+    "fil9": {"raw": "fil9", "train_frac": 0.9},         # the full 1B-char cleaned enwik9 (text8 is its first 100M chars); vocab 27
 }
 DEFAULT_DATASET = "tinyshakespeare"
 VAL_MAX_CHARS = 500_000        # per-round eval must stay ~1 s: score a fixed prefix of the val split
@@ -132,7 +133,8 @@ class Dataset:
         ensure_dataset(name, fetch_from, headers=headers)
         meta = prepare(name)
         p = _paths(name)
-        train = np.fromfile(p["train"], dtype=np.uint16)
+        # memory-map the train split: fil9's is 1.8 GB and several processes share one machine; pages load on demand
+        train = np.memmap(p["train"], dtype=np.uint16, mode="r")
         val = np.fromfile(p["val"], dtype=np.uint16)[:VAL_MAX_CHARS]       # fixed eval prefix, same for every run
         return cls(train=train, val=val, tokenizer=CharTokenizer(meta["chars"]), name=name)
 
