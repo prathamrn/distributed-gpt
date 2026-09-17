@@ -1,31 +1,8 @@
-"""Inject failures into a running pool on a schedule (PRD 8): kill, pause/unpause, restart workers, add a
-late joiner, restart the coordinator. Workers are local `dgpt.worker` processes found by their --name.
-Logs every event to results/<run>/chaos.jsonl so plots can mark them.
+"""Inject failures into a running pool on a schedule (PRD 8). python3 scripts/chaos.py --run k25 --kill
 
     python3 scripts/chaos.py --run k25 --kill worker-3@60 --pause worker-1@90:20 --restart-coordinator@150 --late-join worker-5@200
-
-Actions (time is seconds after chaos.py starts):
-    --kill NAME@T                SIGKILL the worker (the coordinator reaps it after 15 s; its shard is freed)
-    --pause NAME@T:DURATION      SIGSTOP for DURATION s, then SIGCONT (stalls heartbeats + training; it is declared
-                                 dead if DURATION > 15 s and re-registers when it wakes)
-    --restart NAME@T             SIGKILL, then relaunch the worker with its own command line
-    --late-join NAME@T           start a new worker NAME against --coordinator (add --token if the pool needs one)
-    --restart-coordinator@T      SIGKILL the coordinator and relaunch it with the command in results/<run>/coordinator.cmd
-                                 (it auto-resumes from its last checkpoint; workers reconnect on their own)
-
-Connection-level faults need the worker to talk through scripts/chaos_proxy.py (one port per worker); pass the
-proxy's control URL with --proxy and the worker's proxy NAME:
-    --cut NAME@T:DURATION        reset every open connection of NAME and refuse new ones for DURATION s
-                                 (in-flight fetch/upload fails; the worker retries with backoff; > 15 s and it is
-                                 declared dead and re-registers when the link returns)
-    --lag NAME@T:DURATION:MS     add MS milliseconds of latency to every chunk for DURATION s
-    --throttle NAME@T:DURATION:KBS  cap NAME's link at KBS kB/s for DURATION s (a slow tunnel: transfers dominate,
-                                 adaptive K should shrink its step budget rather than cut it off)
-
-    python3 scripts/chaos_proxy.py --upstream 127.0.0.1:8000 --via w1=8001 --control 8100
-    python3 -m dgpt.worker --name w1 --coordinator http://127.0.0.1:8001
-    python3 scripts/chaos.py --run k25 --proxy http://127.0.0.1:8100 --cut w1@30:20 --throttle w1@90:60:300
-"""
+    --kill NAME@T                SIGKILL the worker (reaped after 15 s; its shard is freed)
+    --pause NAME@T:DURATION      SIGSTOP then SIGCONT: stalls heartbeats + training, re-registers on wake"""
 from __future__ import annotations
 
 import argparse
@@ -41,10 +18,14 @@ import time
 
 
 def sh(cmd: list[str]) -> str:
+    """- Run a command and return its stdout, stripped; errors and stderr are swallowed deliberately.
+        - Callers are process queries (pgrep, ps) whose "failure" is just no match"""
     return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
 
 
 def worker_pid(name: str) -> int | None:
+    """- PID of the local worker started with --name NAME, or None.
+    - pgrep by pattern, then filter on the full argv, excluding chaos.py itself (R8/R10); actions use the PID."""
     for pid in sh(["pgrep", "-f", "worker"]).split():
         args = sh(["ps", "-o", "args=", "-p", pid])
         if any(k in args for k in ("dgpt.worker", "worker.py", "dgpt-worker")) and f"--name {name}" in args and "chaos" not in args:
@@ -53,10 +34,13 @@ def worker_pid(name: str) -> int | None:
 
 
 def worker_cmd(pid: int) -> list[str]:
+    """- Read a live process's own argv back out of `ps`, so --restart can relaunch it exactly as it was.
+        - Splitting on whitespace would break an argument containing a space, which no worker flag uses."""
     return sh(["ps", "-o", "args=", "-p", str(pid)]).split()
 
 
 def coordinator_pid(run: str) -> int | None:
+    """- PID of the coordinator serving --run-name RUN, or None; same rule as worker_pid."""
     for pid in sh(["pgrep", "-f", "coordinator"]).split():
         args = sh(["ps", "-o", "args=", "-p", pid])
         if any(k in args for k in ("dgpt.coordinator", "coordinator.py", "dgpt-coordinator")) and f"--run-name {run}" in args and "chaos" not in args:
@@ -65,6 +49,8 @@ def coordinator_pid(run: str) -> int | None:
 
 
 def main():
+    """- Parse the NAME@T action specs, sort them by offset, and execute the schedule against a live pool.
+        - Nothing is mocked: real signals and a real proxy, so the coordinator's reaction is whatever it genuinely is."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
     ap.add_argument("--coordinator", default="http://127.0.0.1:8000", help="for --late-join")

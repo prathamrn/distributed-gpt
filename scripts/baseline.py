@@ -1,11 +1,4 @@
-"""Control experiment: one process, one model, standard AdamW training.
-
-Everything the distributed runs are compared against comes from here. Writes:
-  <out>/log.jsonl      one row per eval (step, tokens, train_loss, val_loss, lr, wall_time, bytes_sent)
-  <out>/ckpt.pt        final weights + config
-  <out>/metrics.json   full-val-split loss / bpc / ppl + throughput summary
-  <out>/sample.txt     generated text
-"""
+"""Control experiment: one process, one model, standard AdamW training."""
 from __future__ import annotations
 
 import os as _os, sys as _sys
@@ -26,6 +19,8 @@ from dgpt.model import GPT
 
 
 def pick_device(name: str) -> str:
+    """- Resolve --device: explicit name passes through, 'auto' prefers Apple MPS over CPU.
+        - No CUDA branch: this is a Mac-side script and dgpt/worker.py owns full cuda/mps/cpu detection."""
     if name != "auto":
         return name
     if torch.backends.mps.is_available():
@@ -35,7 +30,8 @@ def pick_device(name: str) -> str:
 
 @torch.no_grad()
 def quick_val(model: GPT, ds: Dataset, cfg: TrainConfig, device: str) -> float:
-    """Cheap eval on a fixed set of random val batches (same batches every call)."""
+    """- Cheap in-training eval over cfg.eval_batches fixed random val windows.
+    - The RNG is rebuilt from cfg.seed + 1 every call, so every point on the curve scores the same windows."""
     model.eval()
     rng = np.random.default_rng(cfg.seed + 1)
     losses = []
@@ -48,6 +44,8 @@ def quick_val(model: GPT, ds: Dataset, cfg: TrainConfig, device: str) -> float:
 
 
 def train(cfg: TrainConfig, device: str, out_dir: str, log_every: int = 50) -> dict:
+    """- Train one model to cfg.max_steps and write the run directory the rest of the project reads.
+        - Uses exactly the dgpt/config.py recipe the workers use (same AdamW, warmup-then-cosine, batch)"""
     os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
@@ -131,6 +129,8 @@ def train(cfg: TrainConfig, device: str, out_dir: str, log_every: int = 50) -> d
 
 
 def main():
+    """- Parse the CLI, build a TrainConfig, run one control into --out.
+    - Flags mirror the coordinator's --train-set, so a control and a pool run share one recipe."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu", help="cpu | mps | auto")
     ap.add_argument("--max-steps", type=int, default=None)

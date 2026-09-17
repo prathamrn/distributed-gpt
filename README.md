@@ -37,7 +37,7 @@ upload), so a fast GPU behind a slow tunnel trains less but still merges; rounds
 reported or at `round_timeout_factor` × the median cycle time. Results, the
 per-round log, and a resumable checkpoint land in `results/<run-name>/`; restart with `--resume`.
 Only port 8000 on this machine has to be reachable (LAN address, port-forward, tunnel, or Tailscale).
-See `docs/SECURITY.md` for the credential model.
+See `docs/SECURITY.md` for the credential model and `docs/ARCHITECTURE.md` for the system diagrams (Mermaid: components and data flow, one round in time, failure paths).
 
 ### Every flag on a real launch
 

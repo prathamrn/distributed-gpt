@@ -1,24 +1,14 @@
 """Coordinator: owns the global model, runs rounds, merges deltas, checkpoints.
-
-Runs on one machine; workers anywhere connect outbound to it over HTTP.
-
-    python3 -m dgpt.coordinator --run-name k25 --set local_steps=25 --set total_steps=3000
-    dgpt-coordinator --run-name k25            # same thing once installed; resumes from results/k25/ckpt.pt if present
-
-Endpoints (see protocol.py for schemas):
-    POST /register     JSON  -> shard assignment + configs
-    GET  /weights      -> packed weights (long-polls with ?since=<version> until a newer one exists)
-    POST /delta        packed delta -> accepted | stale | unknown_worker | bad_layout | rejected
-    POST /heartbeat    JSON  -> version, whether we hold your delta, whether you are registered
-    GET  /status       JSON summary for humans and chaos.py
-    GET  /health
-"""
+Run it as: python3 -m dgpt.coordinator --run-name k25 --set local_steps=25 (resumes from results/<run>/ckpt.pt).
+Workers anywhere connect outbound over HTTP. Endpoints (schemas in protocol.py): POST /register, GET /weights
+(long-polls on ?since=), POST /delta, POST /heartbeat, GET /status, GET /health."""
 from __future__ import annotations
 
 import argparse
 import collections
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -39,13 +29,19 @@ from dgpt.protocol import (DeltaMeta, DeltaResponse, HeartbeatRequest, Heartbeat
                       RegisterResponse, WeightsMeta, check_layout, config_hash, fingerprint, layout_of, pack,
                       unpack)
 
-LONG_POLL_S = 25.0
+LONG_POLL_S = 25.0        # /weights long-poll cap: under the 30 s idle timeout common to proxies and tunnels
 UPLOAD_GRACE_S = 10.0     # don't close on timeout while a straggler says it is uploading (bounded)
 
 
 class Coordinator:
+    """- Server-side state machine: the authoritative weights, the worker registry, and the one open round.
+    - Handlers only record facts under self.lock; the background _manager thread decides when a round closes.
+    - Built once by main(); _merge, called only from _manager, is the sole place the version advances."""
     def __init__(self, run: RunConfig, train: TrainConfig, resume: bool = False, eval_device: str = "cpu"):
-        self.eval_device = eval_device       # where the per-round validation pass runs (cpu | mps | cuda); the model is moved there for it
+        """- Build or restore version 0, open the first round, and start the round-manager thread.
+        - One RLock guards all state; a Condition on it lets a /weights long-poll sleep until _merge wakes it.
+        - Called once from main() (and the tests) before build_app wraps it in FastAPI; touches no network."""
+        self.eval_device = eval_device       # cpu | mps | cuda; the model is moved there for the validation pass
         self.run, self.train = run, train
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
@@ -78,7 +74,7 @@ class Coordinator:
         self.wall_offset = 0.0
         self.restarts = 0
 
-        # held-out batch for the optional loss check (PRD 7.11)
+        # held-out batch for the optional loss check (PRD 7.11); fixed, so every delta is judged on the same samples
         rng = np.random.default_rng(run.seed + 99)
         self.check_batch = self.ds.get_batch("val", 128, train.block_size, rng)
 
@@ -95,21 +91,27 @@ class Coordinator:
 
     # ---- helpers ------------------------------------------------------------
     def _wall(self) -> float:
+        """- Run time across restarts: this process's elapsed time plus the wall clock restored from the checkpoint,
+        so every log row and metrics.json share one x-axis."""
         return self.wall_offset + time.time() - self.t0
 
     def _log(self, row: dict) -> None:
+        """- Append one JSON row to coordinator.jsonl, flushed per line so a SIGKILLed run still leaves a full log.
+        - Called by _log_event and by _merge for the per-round row every figure is built from."""
         row.setdefault("wall_time", self._wall())
         self.logf.write(json.dumps(row) + "\n"); self.logf.flush()
 
     def _log_event(self, event: str, **kw) -> None:
+        """- Log a named event (register, takeover, worker_dead, delta, stale_delta, merge, done) through _log."""
         self._log({"event": event, **kw})
 
     def _evaluate(self) -> float:
+        """- Validation loss only, for the log row; called from _merge every eval_every_rounds merges."""
         return self._full_eval()["val_loss"]
 
     def _full_eval(self) -> dict:
-        """Validation on the fixed val prefix. Runs on eval_device (the 40M model takes ~80 s per pass on a laptop CPU,
-        ~15 s on its GPU); the CPU copy of the weights stays the source of truth."""
+        """- Validation on the fixed val prefix, on eval_device: ~80 s per pass on a laptop CPU, ~15 s on its GPU.
+        - Called by _evaluate after a merge and by _finish; the CPU weights stay the source of truth."""
         self.model.load_state_dict(self.weights)
         self.model.to(self.eval_device)
         try:
@@ -119,13 +121,20 @@ class Coordinator:
             self.model.to("cpu")
 
     def _alive(self) -> set[str]:
+        """- Workers whose last request (heartbeat, fetch or upload) is newer than dead_after_s.
+        - Alive means heartbeating, not "has fetched the current version", so a straggler is not lapped (R2).
+        - Read by _manager's closing rule, by _merge's log row and by status()."""
         now = time.time()
         return {w for w, info in self.workers.items() if now - info["last_seen"] <= self.run.dead_after_s}
 
     def _open_round(self) -> None:
+        """- Create the empty round dict that delta() fills and _manager watches, at startup and after every _merge.
+        - opened_at is provisional: weights_body restamps it at the first fetch so the deadline bounds work (R5)."""
         self.round = {"version": self.version, "opened_at": time.time(), "participants": set(), "deltas": {}}
 
     def _free_shard(self, prefer: int | None = None) -> int:
+        """- Pick a shard for a registering worker: its old one if free, else any free one, else the least loaded.
+        - Sharing is allowed because n_shards is a fixed run setting while the number of volunteers is not."""
         if prefer is not None and self.shard_owner.get(prefer) is None:
             return prefer
         free = [s for s, o in self.shard_owner.items() if o is None]
@@ -136,11 +145,17 @@ class Coordinator:
         return min(self.shard_owner, key=lambda s: load.get(s, 0))
 
     def _timeout_s(self) -> float:
+        """- Current round deadline: merge.round_timeout over the last ten measured cycle times.
+        - Cycles, not training times: a WAN worker's transfer alone once exceeded a training-time deadline (R16).
+        - Read by _manager, by heartbeat so a worker can stop early, and by the merge log row."""
         return round_timeout(list(self.round_times), self.run.round_timeout_factor,
                              self.run.round_timeout_floor_s, self.run.round_timeout_initial_s)
 
     # ---- checkpoint --------------------------------------------------------
     def _checkpoint(self) -> None:
+        """- Write all recoverable state to ckpt.pt: weights, versions, outer momentum, shards, timings, counters.
+        - Called from __init__ for version 0 and from _merge before the new version is visible, so every version a
+          worker has seen is one a relaunched coordinator can resume to."""
         tmp = self.ckpt_path + ".tmp"
         torch.save({
             "weights": self.weights, "version": self.version, "global_step": self.global_step,
@@ -154,6 +169,9 @@ class Coordinator:
         os.replace(tmp, self.ckpt_path)   # atomic: never a half-written checkpoint
 
     def _load_checkpoint(self) -> None:
+        """- Restore what _checkpoint wrote so a relaunched process continues the same run; called from __init__.
+        - The open round's deltas are not in the file; workers see have_delta_from_you and re-upload the same bytes.
+        - Shard ownership is not restored, only preferred, so a machine that never returns starves nobody."""
         ck = torch.load(self.ckpt_path, map_location="cpu")   # our own file: trusted
         self.weights = {k: v.float() for k, v in ck["weights"].items()}
         self.version, self.global_step = ck["version"], ck["global_step"]
@@ -172,6 +190,9 @@ class Coordinator:
 
     # ---- round manager (background thread) ------------------------------------
     def _manager(self) -> None:
+        """- Background thread owning the clock-driven decisions: reaping silent workers and closing the round.
+        - Polls at 250 ms because two of the three close reasons are not events; worst added merge latency is 1%.
+        - Hands a RoundView to merge.should_close_round (pure and unit-tested) and is the sole caller of _merge."""
         while True:
             time.sleep(0.25)
             with self.lock:
@@ -184,7 +205,7 @@ class Coordinator:
                                  min_workers=self.run.min_workers, timeout_s=self._timeout_s())
                 close, why = should_close_round(view)
                 if close and why.startswith("timeout"):
-                    # bounded grace for a straggler that is mid-upload
+                    # bounded grace for a straggler mid-upload: a fresh "uploading" heartbeat, never past timeout+grace
                     waiting = alive - view.reported
                     uploading = [w for w in waiting if self.workers[w].get("status") == "uploading"
                                  and time.time() - self.workers[w]["last_seen"] < UPLOAD_GRACE_S]
@@ -194,6 +215,8 @@ class Coordinator:
                     self._merge(why)
 
     def _reap_dead(self) -> None:
+        """- Drop workers silent for longer than dead_after_s and hand their shard back, on every _manager tick.
+        - Deleting the entry shrinks _alive(), which lets the round close without a machine that will not answer."""
         now = time.time()
         for wid, info in list(self.workers.items()):
             if now - info["last_seen"] > self.run.dead_after_s:
@@ -205,6 +228,10 @@ class Coordinator:
                 print(f"[coordinator] worker {wid} declared dead (no heartbeat for {self.run.dead_after_s}s); shard {info['shard']} freed")
 
     def _merge(self, why: str) -> None:
+        """- Close the round: average the deltas, take one outer step, checkpoint, publish the next version.
+        - Deltas are weighted by n_steps, since adaptive K lets one worker train 490 steps where another trains
+          110; the outer step is plain averaging by default (R6) and global_step advances by the steps merged.
+        - Called only from _manager; sole writer of weights/version/global_step, and its notify_all frees long-polls."""
         r = self.round
         t_close = time.time()
         deltas = [d for d, _ in r["deltas"].values()]
@@ -244,6 +271,9 @@ class Coordinator:
             self._finish()
 
     def _finish(self) -> None:
+        """- Final full evaluation, metrics.json and the `finished` flag; called once from _merge at the budget.
+        - `finished` is distinct from `done` (protocol state workers see): it is what main()'s --exit-when-done
+          watcher waits for, because a large model's final evals take ~15 s each (R11)."""
         m = self._full_eval()
         m.update({"run": self.run.run_name, "steps": self.global_step, "tokens": self.global_step * self.train.tokens_per_step,
                   "rounds": self.rounds_merged, "version": self.version, "wall_time_s": self._wall(),
@@ -256,10 +286,13 @@ class Coordinator:
         self._log_event("done", **{k: v for k, v in m.items() if k not in ("run_config", "train_config")})
         print(f"[coordinator] DONE: val_loss {m['val_loss']:.4f} after {self.rounds_merged} rounds, "
               f"{m['bytes_total']/1e6:.1f} MB moved, {m['wall_time_s']:.0f}s")
-        self.finished = True          # the exit watcher waits for this, not for `done` (final evals can take >8 s)
+        self.finished = True
 
     # ---- request handlers ------------------------------------------------------
     def register(self, req: RegisterRequest) -> RegisterResponse:
+        """- Admit a worker: check its architecture, give it a shard, a session token and the three configs.
+        - Averaging is by tensor name, so a matching architecture is required; a new session fences the old instance.
+        - Called from POST /register; the entry it creates feeds _alive, _reap_dead, the closing rule and adaptive K."""
         if req.gpt_config_hash is not None and req.gpt_config_hash != self.gpt_cfg_hash:
             raise HTTPException(409, f"model config mismatch: expected {self.gpt_cfg_hash}")
         with self.lock:
@@ -293,8 +326,11 @@ class Coordinator:
                                     run_config=self.run.to_dict(), train_config=self.train.to_dict(), gpt_config=self.gpt_cfg)
 
     def weights_body(self, worker_id: str | None, since: int | None) -> bytes | None:
+        """- Serve the current weights, blocking until there is something worth serving; None means 204 No Content.
+        - Long-polls up to 25 s for a version newer than `since`, and parks at the start barrier until
+          start_workers have registered, so nobody trains alone at full outer-lr weight.
+        - Called by GET /weights; starts the round clock at the first fetch (R5) and stamps served_at/assigned_k."""
         with self.cond:
-            # start barrier: hold every weights request until start_workers have registered (long-poll style)
             deadline = time.time() + LONG_POLL_S
             while len(self.workers) < self.run.start_workers and not self.done:
                 remaining = deadline - time.time()
@@ -314,7 +350,7 @@ class Coordinator:
                 info["fetched_version"] = self.version
                 info["last_seen"] = time.time()
                 if not self.round["participants"]:
-                    self.round["opened_at"] = time.time()     # round clock starts at the first fetch, not at creation
+                    self.round["opened_at"] = time.time()
                 self.round["participants"].add(worker_id)
                 if self.run.adaptive_k:
                     k = adaptive_local_steps(self.run.local_steps, {w: i["steps_per_s"] for w, i in self.workers.items()}, worker_id,
@@ -329,6 +365,10 @@ class Coordinator:
             return body
 
     def delta(self, body: bytes, auth_worker: str | None = None) -> DeltaResponse:
+        """- Admit or reject one uploaded delta; an accepted one lands in round["deltas"] for _manager to merge.
+        - Checks run cheapest first: parse (the body is attacker-controlled), identity, known worker, version+hash,
+          layout (averaging is by tensor name, so a mismatch would take the round down), optional loss check.
+        - Called from POST /delta; the status is the worker's instruction: wait, refetch, re-register or give up."""
         self.bytes_in += len(body)
         try:
             tensors, meta = unpack(body)
@@ -336,6 +376,7 @@ class Coordinator:
         except Exception as e:
             self.rejected_count += 1
             return DeltaResponse(status="bad_layout", version=self.version, detail=f"unparseable: {e}")
+        # the claimed id rides inside the packed body, so the middleware cannot bind it: compare it here
         if auth_worker is not None and m.worker_id != auth_worker:
             self.rejected_count += 1
             self._log_event("rejected_delta", worker=auth_worker, version=self.version, reason=f"claimed to be {m.worker_id}")
@@ -345,7 +386,7 @@ class Coordinator:
                 return DeltaResponse(status="unknown_worker", version=self.version, detail="re-register")
             info = self.workers[m.worker_id]
             info["last_seen"] = time.time()
-            self._learn_timing(info, m)
+            self._learn_timing(info, m)   # before the admission checks: the round a worker misses explains why (R16)
             if m.version != self.version or m.weights_hash != self.weights_hash:
                 self.stale_count += 1
                 self._log_event("stale_delta", worker=m.worker_id, delta_version=m.version, current_version=self.version, n_steps=m.n_steps)
@@ -360,13 +401,15 @@ class Coordinator:
                     self.rejected_count += 1
                     self._log_event("rejected_delta", worker=m.worker_id, version=self.version, reason=bad)
                     return DeltaResponse(status="rejected", version=self.version, detail=bad)
-            self.round["deltas"][m.worker_id] = (tensors, m.model_dump())
+            self.round["deltas"][m.worker_id] = (tensors, m.model_dump())   # keyed by id: a re-upload overwrites
             self._log_event("delta", worker=m.worker_id, version=m.version, n_steps=m.n_steps, train_loss=m.train_loss,
                             round_wall_s=m.round_wall_s, overhead_s=info["overhead_s"], bytes=len(body), dtype=m.dtype)
             return DeltaResponse(status="accepted", version=self.version)
 
     def _loss_check(self, delta: dict) -> str | None:
-        """Reject a delta that makes the held-out batch worse by more than the margin (PRD 7.11)."""
+        """- Reject a delta that makes the fixed held-out batch worse by more than the margin (PRD 7.11).
+        - Applied on its own (W - delta) so each worker is judged by its own contribution; called from delta() only
+          when run.loss_check is on, since it costs a forward pass per upload."""
         x, y = self.check_batch
         with torch.no_grad():
             self.model.load_state_dict(self.weights); _, base = self.model(x, y)
@@ -376,9 +419,9 @@ class Coordinator:
         return None
 
     def _learn_timing(self, info: dict, m: DeltaMeta) -> None:
-        """Per-worker speed and transfer overhead, measured on the coordinator's clock from the moment the weights
-        were served to the moment the delta arrived. Stale and partial deltas count too: the round they missed
-        is exactly when we need to learn why. Feeds adaptive K and the round timeout (see merge.adaptive_local_steps)."""
+        """- Per-worker speed and overhead, timed on our own clock from serving the weights to the delta arriving.
+        - Stale and partial deltas count too: the round they missed is exactly when we need to learn why (R16).
+        - Writes steps_per_s, overhead_s and round_times, read by adaptive_local_steps and _timeout_s next round."""
         if not m.round_wall_s or m.n_steps <= 0 or info.get("fetched_version") != m.version or not info.get("served_at"):
             return
         speed = m.n_steps / m.round_wall_s
@@ -387,27 +430,30 @@ class Coordinator:
         cycle = time.time() - info["served_at"]
         overhead = max(0.0, cycle - m.round_wall_s)         # download + upload + anything that was not training
         info["overhead_s"] = overhead if info["overhead_s"] is None else 0.5 * info["overhead_s"] + 0.5 * overhead
-        # timeout history: what this worker's full cycle takes (or would have taken, if it was cut short)
+        # timeout history: the real cycle, or the planned one if cut short (else the deadline ratchets down on stragglers)
         assigned = info.get("assigned_k") or self.run.local_steps
         planned = info["overhead_s"] + assigned / info["steps_per_s"]
         self.round_times.append(cycle if m.n_steps >= assigned else planned)
         info["served_at"] = None                            # one measurement per fetch
 
     def heartbeat(self, hb: HeartbeatRequest) -> HeartbeatResponse:
+        """- Liveness up, control down, every heartbeat_interval_s (5 s): the only mid-round channel in a pull-only
+          design, carrying the deadline, done, registered and have_delta_from_you.
+        - registered=False is a worker's cue to re-register, covering both a restart and having been reaped."""
         with self.lock:
             info = self.workers.get(hb.worker_id)
             if info is None:
                 return HeartbeatResponse(ok=True, version=self.version, have_delta_from_you=False, registered=False, done=self.done)
             info["last_seen"] = time.time(); info["status"] = hb.status; info["local_step"] = hb.local_step
-            # no deadline until someone has fetched this version: the round clock starts at the first fetch, and a
-            # deadline computed before that (e.g. while workers wait at the start barrier) would be stale and cut
-            # the first worker off after one step
+            # seconds remaining, never an absolute time (no clock comparison); None until someone has fetched this version
             closes_in = (max(0.0, self._timeout_s() - (time.time() - self.round["opened_at"]))
                          if self.round["participants"] else None)
             return HeartbeatResponse(ok=True, version=self.version, have_delta_from_you=hb.worker_id in self.round["deltas"],
                                      registered=True, done=self.done, round_closes_in_s=closes_in)
 
     def status(self) -> dict:
+        """- Snapshot for humans and for scripts/chaos.py (GET /status): per-worker speed, overhead, assigned K and
+          last-seen, next to the open round's participants and deadline."""
         with self.lock:
             alive = self._alive()
             return {
@@ -428,17 +474,21 @@ class Coordinator:
 # ---- FastAPI wiring -------------------------------------------------------------
 
 def build_app(coord: Coordinator, token: str | None = None, registry=None) -> FastAPI:
-    """Auth modes: none (LAN/dev), shared token (X-Token), or per-worker signed requests (registry, see auth.py)."""
+    """- Wrap the live Coordinator in FastAPI; auth is none (LAN/dev), a shared X-Token, or per-worker signatures.
+    - Every route authenticates, binds the claimed id, fences old instances, then calls one Coordinator method."""
     app = FastAPI(title="decentralized-gpt coordinator")
     verifier = None
     if registry is not None:
         from dgpt.auth import AuthError, Verifier
         verifier = Verifier(registry)
 
-        PUBLIC = {"/health", "/install.sh", "/install.ps1"}
+        PUBLIC = {"/health", "/install.sh", "/install.ps1"}    # what a bare machine must reach before it has a credential
 
         @app.middleware("http")
         async def require_signature(request: Request, call_next):
+            """- Verify every non-public request in one place, so no handler can forget to; the body is read here
+              because the signature covers method, path-with-query and sha256(body).
+            - Rejections log the claimed worker name: R14 lost hours to a 401 the coordinator gave no reason for."""
             if request.url.path in PUBLIC or request.url.path.startswith("/wheels/"):
                 return await call_next(request)
             body = await request.body()
@@ -452,18 +502,22 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
     elif token:
         @app.middleware("http")
         async def require_token(request: Request, call_next):
+            """- Shared-token mode: one secret for everyone as a plain header, with the same public exemptions.
+            - It revokes nobody and binds nothing to a sender, so bind() and fence() are no-ops; LAN/dev only."""
             if request.url.path not in ("/health", "/install.sh", "/install.ps1") and not request.url.path.startswith("/wheels/") and request.headers.get("x-token") != token:
                 return Response(status_code=401, content="missing or wrong X-Token")
             return await call_next(request)
 
     def bind(request: Request, claimed: str | None) -> None:
-        """With per-worker auth, the identity inside a message must be the one that signed it."""
+        """- With per-worker auth, the identity inside a message must be the one that signed it.
+        - Called by /register, /weights and /heartbeat; /delta compares after unpacking, the id being in the body."""
         wid = getattr(request.state, "worker_id", None)
         if wid is not None and claimed is not None and claimed != wid:
             raise HTTPException(403, f"message claims worker {claimed!r} but was signed by {wid!r}")
 
     def fence(worker_id: str | None, session: str | None) -> None:
-        """A worker instance whose session was superseded by a newer registration must stop (409)."""
+        """- A worker instance whose session was superseded by a newer registration must stop (409).
+        - Nothing is killed: the old instance learns on its next /weights, /delta or /heartbeat and exits."""
         if not worker_id or not session:
             return                                    # legacy worker without a session header: not fenced
         with coord.lock:                              # same lock as every other read of coord.workers (RLock: handlers may hold it)
@@ -473,6 +527,9 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
             raise HTTPException(409, "superseded: another instance registered with this token; this one must stop")
 
     def signed(request: Request, body: bytes, media_type: str) -> Response:
+        """- Sign a /register or /weights body with the requesting worker's own secret.
+        - The worker refuses a body not signed with its credential, which stops an impostor at the coordinator's
+          URL from feeding a donor arbitrary weights or a hostile config."""
         headers = {}
         wid = getattr(request.state, "worker_id", None)
         if wid is not None:
@@ -482,43 +539,51 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
 
     @app.get("/health")
     def health():
+        """- Unauthenticated liveness probe that also names the auth mode, so a donor knows whether a credential
+          is needed before installing anything."""
         return {"ok": True, "role": "coordinator", "version": coord.version, "done": coord.done,
                 "dataset": coord.train.dataset, "auth": "signed" if verifier else ("token" if token else "none")}
 
     HERE = os.path.dirname(os.path.abspath(__file__))
 
     def _wheel_path() -> str | None:
+        """- Newest wheel built into dist/, or None, so a donor installs this coordinator's build, not a git branch."""
         import glob as _glob
         w = sorted(_glob.glob(os.path.join(HERE, "..", "dist", "dgpt-*.whl")) + _glob.glob(os.path.join(os.getcwd(), "dist", "dgpt-*.whl")))
         return w[-1] if w else None
 
     def _public_base(request: Request) -> str:
+        """- Base URL the caller actually used, honoring X-Forwarded-Proto: tunnels terminate TLS elsewhere, so
+          without the header the generated installer would hand out http:// for an https:// tunnel."""
         scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
         return f"{scheme}://{request.headers.get('host', request.url.netloc)}"
 
     def _wheel_url(request: Request) -> str:
+        """- Absolute URL of the served wheel (or the bare package name), so `curl <url>/install.sh | sh` suffices."""
         p = _wheel_path()
         return f"{_public_base(request)}/wheels/{os.path.basename(p)}" if p else "dgpt"
 
     @app.get("/install.sh")
     def install_sh(request: Request):
-        """The one-line installer, pointed at this coordinator's own wheel: curl -fsSL <url>/install.sh | sh"""
+        """- The one-line installer aimed at this coordinator: the file on disk is generic, the two rewrites point
+          it at this process's wheel and address. SRC= is matched by shape so editing the placeholder is safe."""
         text = open(os.path.join(HERE, "install", "install.sh")).read()
-        text = text.replace('SRC="${DGPT_SRC:-dgpt @ git+https://github.com/YOUR_ORG/distribute}"',
-                            f'SRC="${{DGPT_SRC:-{_wheel_url(request)}}}"')
+        text = re.sub(r'^SRC="\$\{DGPT_SRC:-[^}]*\}"', f'SRC="${{DGPT_SRC:-{_wheel_url(request)}}}"', text, count=1, flags=re.M)
         text = text.replace("http://HOST:8000", _public_base(request))
         return Response(content=text, media_type="text/x-shellscript")
 
     @app.get("/install.ps1")
     def install_ps1(request: Request):
+        """- Windows PowerShell version of the same one-line installer, with the same two substitutions."""
         text = open(os.path.join(HERE, "install", "install.ps1")).read()
-        text = text.replace('"dgpt @ git+https://github.com/YOUR_ORG/distribute"', f'"{_wheel_url(request)}"')
+        text = re.sub(r'else \{ "dgpt @ git\+[^"]*" \}', f'else {{ "{_wheel_url(request)}" }}', text, count=1)
         text = text.replace("http://HOST:8000", _public_base(request))
         return Response(content=text, media_type="text/plain")
 
     @app.get("/wheels/{fn}")
     def wheel(fn: str):
-        """Served under its real filename: uv/pip need the version in the name."""
+        """- Served under its real filename (uv/pip need the version in it); any other name 404s, so this is not a
+          general file server."""
         from fastapi.responses import FileResponse
         p = _wheel_path()
         if not p or fn != os.path.basename(p):
@@ -527,7 +592,8 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
 
     @app.get("/data/{name}/{fn}")
     def data_file(name: str, fn: str):
-        """Serve the tokenized dataset to workers that do not have it (installed donors)."""
+        """- Serve the tokenized dataset to workers that do not have it (installed donors).
+        - Restricted to the names data.py knows and to this run's dataset, and authenticated: it is real bandwidth."""
         from dgpt.data import DATASET_FILES, _paths, ensure_dataset
         if fn not in DATASET_FILES or name != coord.train.dataset:
             raise HTTPException(404, "not served")
@@ -538,12 +604,16 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
 
     @app.post("/register")
     def register(req: RegisterRequest, request: Request):
+        """- Bind the claimed id to the signer, then sign the reply, so the worker knows it registered with the
+          real coordinator rather than an impostor sitting at the same URL."""
         bind(request, req.worker_id)
         out = coord.register(req).model_dump_json().encode()
         return signed(request, out, "application/json")
 
     @app.get("/weights")
     def weights(request: Request, worker_id: str | None = None, since: int | None = None):
+        """- Bind and fence, then block inside weights_body until a new version or the long-poll expires.
+        - None becomes a 204, which the worker retries instead of treating as an error."""
         bind(request, worker_id)
         fence(worker_id, request.headers.get("x-session"))
         body = coord.weights_body(worker_id, since)
@@ -553,24 +623,32 @@ def build_app(coord: Coordinator, token: str | None = None, registry=None) -> Fa
 
     @app.post("/delta", response_model=DeltaResponse)
     async def delta(request: Request):
+        """- Hand the raw packed body to Coordinator.delta with the authenticated identity, which is compared there
+          against the worker id carried inside that body (bind() cannot reach it)."""
         body = await request.body()
         fence(request.headers.get("x-worker"), request.headers.get("x-session"))
         return coord.delta(body, auth_worker=getattr(request.state, "worker_id", None))
 
     @app.post("/heartbeat", response_model=HeartbeatResponse)
     def heartbeat(hb: HeartbeatRequest, request: Request):
+        """- The 5 s call that keeps a worker alive and carries the deadline, done, and the re-register/re-upload
+          signals back to it."""
         bind(request, hb.worker_id)
         fence(hb.worker_id, request.headers.get("x-session"))
         return coord.heartbeat(hb)
 
     @app.get("/status")
     def status():
+        """- Snapshot for humans and for scripts/chaos.py; behind auth like every other non-public route."""
         return coord.status()
 
     return app
 
 
 def parse_args(argv=None):
+    """- Command-line surface of the coordinator.
+    - --set and --train-set are the generic escape hatch onto RunConfig and TrainConfig, so any field is
+      overridable without a new flag, which is what lets scripts/experiments.py drive a sweep from one table."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-name", default="run")
     ap.add_argument("--set", action="append", default=[], help="override RunConfig, e.g. --set local_steps=25")
@@ -591,6 +669,8 @@ def parse_args(argv=None):
 
 
 def apply_overrides(cfg, overrides: list[str]):
+    """- Apply `key=value` strings onto a config dataclass, coercing each value to the type already there.
+    - An unknown key exits rather than being ignored: a typo in a sweep would otherwise run the default silently."""
     for kv in overrides:
         k, v = kv.split("=", 1)
         if not hasattr(cfg, k):
@@ -607,9 +687,14 @@ def apply_overrides(cfg, overrides: list[str]):
 
 
 def main():
-    sys.stdout.reconfigure(line_buffering=True)
+    """- Entry point for `dgpt-coordinator` and `python3 -m dgpt.coordinator`.
+    - Parses flags, optionally administers credentials and exits, builds the Coordinator (which starts the round
+      manager) and the app, then hands it to uvicorn; resume is the default whenever ckpt.pt exists.
+    - --with-local-worker donates this machine as an ordinary worker subprocess, same HTTP and auth as any other."""
+    sys.stdout.reconfigure(line_buffering=True)   # os._exit in the watcher below skips flushing, which once ate a run (R3)
     args = parse_args()
     registry = None
+    # --invite/--revoke act on the same workers.json a running coordinator hot-reloads: no restart to add or cut off
     if args.auth:
         from dgpt.auth import Registry
         registry = Registry(args.auth)

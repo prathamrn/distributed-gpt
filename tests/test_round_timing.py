@@ -1,6 +1,4 @@
-"""Round timing is transfer-aware: the coordinator measures each worker's cycle (download + train + upload) from
-the moment it served the weights, learns speed and overhead even from stale deltas, and sizes the timeout from
-cycle times rather than training times."""
+"""Round timing is transfer-aware: the coordinator measures each worker's cycle (download + train + upload) from"""
 import os
 import pytest
 import torch
@@ -14,14 +12,17 @@ pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(HERE, "data", "t
 
 
 class Clock:
+    """- A hand-advanced fake clock monkeypatched over time.time, so timing tests run instantly."""
     def __init__(self, t=1000.0):
         self.t = t
     def __call__(self):
+        """- Return the current fake time; tests move it forward by assigning to .t."""
         return self.t
 
 
 @pytest.fixture
 def coord(tmp_path, monkeypatch):
+    """- A Coordinator on the fake clock with adaptive K, a 2x timeout factor and liveness effectively off."""
     clock = Clock()
     import dgpt.coordinator as C
     monkeypatch.setattr(C.time, "time", clock)
@@ -33,17 +34,20 @@ def coord(tmp_path, monkeypatch):
 
 
 def register(c, name):
+    """- Register a worker by name, without the HTTP layer."""
     from dgpt.protocol import RegisterRequest
     c.register(RegisterRequest(worker_id=name, gpt_config_hash=None))
 
 
 def fetch(c, name):
+    """- Fetch weights as a worker would and return the metadata, which carries this worker's assigned K."""
     from dgpt.protocol import unpack
     _, meta = unpack(c.weights_body(name, None))
     return meta
 
 
 def send(c, name, meta, n_steps, train_s):
+    """- Upload a zero delta reporting n_steps trained in train_s seconds, and return the coordinator's status."""
     delta = {k: torch.zeros_like(v) for k, v in c.weights.items()}
     body = pack(delta, DeltaMeta(worker_id=name, version=meta["version"], weights_hash=meta["weights_hash"], n_steps=n_steps,
                                  n_tokens=n_steps, shard_id=0, round_wall_s=train_s).model_dump(), "float32")
@@ -51,6 +55,7 @@ def send(c, name, meta, n_steps, train_s):
 
 
 def test_cycle_time_feeds_timeout_and_k(coord):
+    """- The main case: two workers with the same nominal K where one spends 30 of its 34 seconds on transfer."""
     c, clock = coord, coord.clock
     register(c, "mac"); register(c, "wan")
     m_mac = fetch(c, "mac"); m_wan = fetch(c, "wan")
@@ -74,6 +79,7 @@ def test_cycle_time_feeds_timeout_and_k(coord):
 
 
 def test_stale_delta_still_teaches_speed_and_overhead(coord):
+    """- A delta that arrives too late is not merged, but it is still evidence about the machine that sent it."""
     c, clock = coord, coord.clock
     register(c, "mac"); register(c, "slow")
     m_mac = fetch(c, "mac"); m_slow = fetch(c, "slow")
@@ -94,6 +100,7 @@ def test_stale_delta_still_teaches_speed_and_overhead(coord):
 
 
 def test_tiny_partial_does_not_overwrite_a_real_speed(coord):
+    """- A one-step partial uploaded at a deadline says almost nothing about a machine's speed"""
     c, clock = coord, coord.clock
     register(c, "w")
     m = fetch(c, "w"); clock.t += 10
@@ -106,6 +113,7 @@ def test_tiny_partial_does_not_overwrite_a_real_speed(coord):
 
 
 def test_no_deadline_before_the_first_fetch(coord):
+    """- A worker waiting at the start barrier has not been served any weights"""
     from dgpt.protocol import HeartbeatRequest
     c = coord
     register(c, "w")

@@ -1,13 +1,6 @@
-"""Worker: register, fetch weights, train K steps on a shard, upload delta, repeat.
+"""Worker: register, fetch weights, train K steps on a shard, upload delta
 
-Runs on any machine (flags or env vars):
-    python3 -m dgpt.worker --name w1 --coordinator http://127.0.0.1:8000 --threads 2
-
-Fault handling (PRD 7.9): every request retries with exponential backoff; a stale
-delta means "refetch and start over"; if the coordinator forgets us (restart or
-we were declared dead) we re-register; if the coordinator restarts and lost our
-accepted delta we re-upload it (idempotent). A heartbeat thread runs throughout.
-"""
+    python3 -m dgpt.worker --name w1 --coordinator http://127.0.0.1:8000 --threads 2"""
 from __future__ import annotations
 
 import argparse
@@ -31,11 +24,15 @@ from dgpt.auth import parse_invite, request_headers, sign_body
 
 
 class HmacAuth(requests.auth.AuthBase):
-    """Signs every request with the worker's secret (auth.py). The secret never leaves this process."""
+    """- Signs every request with the worker's secret (auth.py).
+        - The secret never leaves this process."""
     def __init__(self, worker_id: str, secret: bytes):
+        """- Hold the identity and the secret that were parsed out of the invite token."""
         self.worker_id, self.secret = worker_id, secret
 
     def __call__(self, r):
+        """- requests auth hook: add X-Worker, X-Timestamp, X-Nonce, X-Signature to every outgoing call.
+        - Signs method, path+query, timestamp, nonce and sha256(body), so nothing can be replayed or altered."""
         body = r.body.encode() if isinstance(r.body, str) else r.body
         r.headers.update(request_headers(self.worker_id, self.secret, r.method, r.url, body))
         return r
@@ -44,15 +41,21 @@ BACKOFF_MAX_S = 30.0
 
 
 def env(name: str, default: str) -> str:
+    """- Read an environment variable with a default; every CLI flag in main() has an env twin for installers."""
     return os.environ.get(name, default)
 
 
 def socket_hostname() -> str:
+    """- Short hostname, used to build the default worker name.
+        - A convenience only: in signed mode the identity comes from the invite token and --name is ignored."""
     import socket
     return socket.gethostname().split(".")[0]
 
 
 def pick_device(name: str) -> str:
+    """- Resolve --device auto to cuda, then mps, then cpu.
+    - Auto-detection lets one installer command work on a lab GPU, a laptop and a VM alike.
+    - Called once from Worker.__init__."""
     if name != "auto":
         return name
     if torch.cuda.is_available():
@@ -63,8 +66,12 @@ def pick_device(name: str) -> str:
 
 
 class Worker:
+    """- One volunteer machine's entire participation in a run: registration, the round loop
+        - Everything it knows about the run - K, the model shape, the dataset"""
     def __init__(self, name: str, coordinator: str, dtype: str, threads: int, speed_hint: str, cpus: float | None,
                  malicious: bool, out_dir: str | None, device: str = "cpu", token: str | None = None):
+        """- Set up identity, device, HTTP session and credentials; nothing here talks to the coordinator yet.
+                - Called from main()."""
         self.name, self.base, self.dtype = name, coordinator.rstrip("/"), dtype
         self.speed_hint, self.cpus, self.malicious = speed_hint, cpus, malicious
         self.device = pick_device(device)
@@ -116,17 +123,21 @@ class Worker:
 
     # ---- logging / http -----------------------------------------------------------
     def log(self, **row):
+        """- Append one JSON row to results/<run>/<name>.jsonl: register, round, error, done.
+                - The host reads these next to the coordinator's own log to get per-worker step rates"""
         row.setdefault("wall_time", time.time() - self.t0)
         row.setdefault("worker", self.name)
         if self.logf:
             self.logf.write(json.dumps(row) + "\n"); self.logf.flush()
 
     def say(self, msg: str):
+        """- Print one prefixed, flushed line; this is what the donor sees, so it says what happens next."""
         print(f"[{self.name}] {msg}", flush=True)
 
     def _retry(self, fn, what: str):
-        """Call fn() until it succeeds. Network errors, truncated responses and 5xx (a tunnel or proxy hiccup)
-        are retried forever with exponential backoff; a 401/403 is fatal with the server's reason shown."""
+        """- Call fn() until it succeeds, with exponential backoff (1 s doubling to 30 s).
+        - Transient errors (connection, timeout, 5xx) retry forever; 401/403/409-superseded/bad_layout exit.
+        - Wraps every HTTP call the worker makes."""
         delay = 1.0
         while not self.stop.is_set():
             try:
@@ -146,6 +157,8 @@ class Worker:
 
     # ---- protocol steps --------------------------------------------------------------
     def register(self):
+        """- Exchange identity for a shard, a session and the run/train/model configs, then build everything local.
+                - Called from _run_loop at startup and again whenever the coordinator says it does not know us."""
         # First contact: adopt whatever model config the coordinator serves (so bigger models need no client change).
         # Re-registration: send the hash of the config we already built, so a mismatch is caught.
         gpt_hash = config_hash(self.model.cfg.to_dict()) if self.model is not None else None
@@ -193,6 +206,8 @@ class Worker:
         self.log(event="register", shard=self.shard, version=resp["version"])
 
     def heartbeat_loop(self):
+        """- Daemon thread: POST /heartbeat every heartbeat_interval_s and store what comes back.
+                - Started by register()."""
         while not self.stop.is_set():
             try:
                 r = self.http.post(f"{self.base}/heartbeat", json={"worker_id": self.name, "status": self.status,
@@ -213,6 +228,8 @@ class Worker:
             self.stop.wait(self.run.heartbeat_interval_s if self.run else 5.0)
 
     def fetch_weights(self, since: int | None):
+        """- Download the current weights, long-polling when `since` is given; returns (tensors, meta) or (None, None).
+                - Called from _run_loop once per round."""
         def go():
             params = {"worker_id": self.name}
             if since is not None:
@@ -235,7 +252,8 @@ class Worker:
         return tensors, meta
 
     def _check_response_signature(self, r) -> None:
-        """With per-worker auth the coordinator signs weights with our secret; an impostor cannot."""
+        """- With per-worker auth the coordinator signs weights with our secret; an impostor cannot.
+        - Fatal rather than retried: a wrong signature means the URL belongs to the wrong coordinator."""
         if self.secret is None:
             return
         sig = r.headers.get("X-Signature")
@@ -244,6 +262,8 @@ class Worker:
                      f"wrong coordinator or a man-in-the-middle. Refusing to train on it.")
 
     def upload_delta(self, body: bytes) -> dict | None:
+        """- POST the packed delta and return the coordinator's status dict, or None if stopping.
+        - Called from _run_loop after train_round, and by the re-upload path when a coordinator restart lost a delta."""
         def go():
             r = self.http.post(f"{self.base}/delta", data=body, headers={"Content-Type": "application/octet-stream"}, timeout=300)
             r.raise_for_status()
@@ -257,6 +277,9 @@ class Worker:
 
     # ---- data ------------------------------------------------------------------------
     def batch(self, rng: np.random.Generator):
+        """- Draw one (x, y) batch of token windows according to the shard mode.
+        - full samples the whole text, interleaved uses starts congruent to the shard, contiguous stays in one slice.
+        - Called once per local step by train_round with the round's seeded RNG."""
         bs, T = self.train.batch_size, self.train.block_size
         d = self.ds.train
         if self.run.shard_mode == "interleaved":          # start positions congruent to shard mod N: disjoint, IID, full offset diversity
@@ -273,7 +296,9 @@ class Worker:
 
     # ---- one round ---------------------------------------------------------------------
     def train_round(self, start: dict, meta: dict) -> tuple[dict, int, float, float]:
-        """Train up to meta['local_steps'] steps from `start`. Returns (delta, n_steps, mean_loss, train_s)."""
+        """- Train up to meta['local_steps'] steps from `start`; returns (delta, n_steps, mean_loss, train_s).
+        - May stop early at the heartbeat deadline and return a partial delta, which the coordinator weights by steps.
+        - Called once per round by _run_loop with the weights and header it just fetched."""
         K, g0, n_alive, version = meta["local_steps"], meta["global_step"], meta["n_workers_alive"], meta["version"]
         self.model.load_state_dict(start)
         if getattr(self.run, "reset_inner_opt", False):
@@ -338,7 +363,8 @@ class Worker:
 
     # ---- main loop -------------------------------------------------------------------------
     def run_forever(self):
-        """Never let an unexpected exception leave the worker alive-but-idle: log it and go around again."""
+        """- Never let an unexpected exception leave the worker alive-but-idle: log it and go around again.
+                - Called by main() and is the last frame on the stack."""
         backoff = 2.0
         while not self.stop.is_set():
             try:
@@ -354,6 +380,9 @@ class Worker:
                 self.need_register.set()
 
     def _run_loop(self):
+        """- The round loop: register if needed, fetch, train, upload, repeat until the coordinator says done.
+        - waiting_since is the version already contributed; pending holds the last delta in case it must be re-sent.
+        - Called from run_forever, which restarts it after any unexpected exception."""
         if self.run is None:
             self.register()                   # starts the heartbeat thread itself
         waiting_since: int | None = None
@@ -411,6 +440,8 @@ class Worker:
 
 
 def main():
+    """- Entry point for dgpt-worker and python3 -m dgpt.worker: parse flags, build a Worker, run forever.
+    - Every flag has an environment twin so an installer or service file can configure a donor machine."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default=env("NODE_NAME", "") or f"{socket_hostname()}-{os.getpid() % 1000}")
     ap.add_argument("--coordinator", default=env("COORDINATOR_URL", "http://127.0.0.1:8000"))

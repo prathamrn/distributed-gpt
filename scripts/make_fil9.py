@@ -1,9 +1,6 @@
 """Turn enwik9 (the first 10^9 bytes of the 2006 English Wikipedia XML dump) into fil9: lowercase a-z and single
-spaces only, digits spelled out, markup removed. A line-for-line port of Matt Mahoney's wikifil.pl, so that
-fil9[:100_000_000] == text8 (verified by scripts/make_fil9.py --check).
 
-    python3 scripts/make_fil9.py data/fil9/enwik9 data/fil9/fil9 --check data/text8/text8
-"""
+    python3 scripts/make_fil9.py data/fil9/enwik9 data/fil9/fil9 --check data/text8/text8"""
 import argparse
 import re
 import sys
@@ -32,6 +29,8 @@ UPPER_TO_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqr
 
 
 def clean_record(rec: str) -> str:
+    """- Apply the markup-stripping rules to one record and return its plain-text form, space-separated.
+        - Perl's order (markup, case fold, digits, collapse) since each stage assumes the last ran"""
     for rx, sub in RULES:
         rec = rx.sub(sub, rec)
     rec = " " + rec + " "
@@ -42,7 +41,9 @@ def clean_record(rec: str) -> str:
 
 
 def convert(src: str, dst: str, chunk: int = 1 << 24) -> None:
-    """Streams the 1 GB input in chunks (records end at '>'), so peak memory stays under ~100 MB."""
+    """- Stream the 1 GB dump in chunks (records end at '>'), so peak memory stays under ~100 MB.
+    - latin-1 keeps it byte-oriented like the Perl original; multi-byte UTF-8 becomes spaces, matching text8.
+    - Output is tokenized by dgpt/data.py straight from the raw bytes."""
     out = open(dst, "w", encoding="latin-1")
     text = False
     n = 0
@@ -78,6 +79,7 @@ def convert(src: str, dst: str, chunk: int = 1 << 24) -> None:
 
 
 def main():
+    """- Convert src to dst and, with --check, verify the result's first 100M bytes equal text8."""
     ap = argparse.ArgumentParser()
     ap.add_argument("src"); ap.add_argument("dst")
     ap.add_argument("--check", help="path to text8: verify fil9[:1e8] == text8")

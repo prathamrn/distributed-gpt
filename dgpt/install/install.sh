@@ -4,7 +4,7 @@
 #   DGPT_SRC=/path/to/dgpt-0.1.0-py3-none-any.whl sh install.sh     # from a wheel you were given
 # Installs uv (which brings its own Python), then the worker into an isolated tool environment.
 set -e
-SRC="${DGPT_SRC:-dgpt @ git+https://github.com/YOUR_ORG/distribute}"   # replace with your repo or wheel URL
+SRC="${DGPT_SRC:-dgpt @ git+https://github.com/prathamrn/distributed-gpt}"   # replace with your repo or wheel URL
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "[dgpt] installing uv (Python package manager; also fetches Python if needed)"

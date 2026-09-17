@@ -1,14 +1,8 @@
-"""Run distributed experiments back to back: a coordinator plus N local worker processes each.
+"""Run distributed experiments back to back: a coordinator plus N local worker processes each. python3 python3
 
     python3 scripts/experiments.py --list
     python3 scripts/experiments.py diag_interleaved diag_plain_avg        # run some
-    python3 scripts/experiments.py all                                    # run every experiment not yet done
-    python3 scripts/experiments.py --table                                # summarize results/*/metrics.json
-
-Each experiment is a dict: workers (N), threads per worker (`cpus`), device, coordinator --set
-overrides, --train-set overrides. Workers are `worker.py` subprocesses on this machine (CPU by
-default so N of them can share the box). Results land in results/<name>/ like any other run.
-"""
+    python3 scripts/experiments.py all                                    # run every experiment not yet done"""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +22,8 @@ BASE = dict(workers=4, cpus=2.0, device="cpu", sets=["local_steps=25", "total_st
 
 
 def exp(**kw) -> dict:
+    """- Build one experiment dict from BASE, with `sets` and `train` appended rather than replaced.
+        - Appending works because the coordinator applies --set left to right"""
     e = {k: (list(v) if isinstance(v, list) else v) for k, v in BASE.items()}
     for k, v in kw.items():
         if k in ("sets", "train"):
@@ -118,7 +114,6 @@ EXPERIMENTS = {
                          train=["dataset=text8", "lr=4e-3", "n_layer=6", "n_head=6", "n_embd=384", "max_steps=12000"]),
 }
 
-# single-machine runs made with baseline.py (not through this runner), with their reasons
 SINGLE_RUNS = {
     "baseline":              "PRD control: one machine, batch 64, 3000 steps, lr 1e-3 (seed 1337)",
     "baseline_seed1":        "Control, seed 1: run-to-run variance of the control",
@@ -139,6 +134,8 @@ SINGLE_RUNS = {
 
 
 def start_workers(n: int, threads: int, device: str, out_dir: str) -> list[subprocess.Popen]:
+    """- Launch n real dgpt.worker subprocesses against the local coordinator and return their Popen handles.
+    - Real processes, so a sweep exercises registration, heartbeats and timeouts, not a simulation."""
     procs = []
     for i in range(1, n + 1):
         log = open(os.path.join(out_dir, f"worker-{i}.out"), "a")
@@ -148,6 +145,8 @@ def start_workers(n: int, threads: int, device: str, out_dir: str) -> list[subpr
 
 
 def last_round_line(path: str) -> str:
+    """- Return the most recent round or DONE line from a coordinator's captured stdout, for the progress print.
+        - Reads the human-readable capture, not coordinator.jsonl: it only shows a person the queue is alive."""
     try:
         lines = [l for l in open(path) if "] round" in l or "DONE" in l]
         return lines[-1].strip()[:120] if lines else "(starting)"
@@ -156,6 +155,8 @@ def last_round_line(path: str) -> str:
 
 
 def run_one(name: str, e: dict) -> dict | None:
+    """- Run one experiment end to end: guard the port, start a coordinator, start N workers, wait, read metrics.
+    - Real HTTP on localhost because the coordination code is what is under test."""
     threads = max(1, int(round(float(e.get("cpus", 2.0)))))
     device = e.get("device", "cpu")
     print(f"\n=== {name}: {e['workers']} workers x {threads} threads ({device}), sets={e['sets']} train={e['train']} ===", flush=True)
@@ -210,6 +211,8 @@ def run_one(name: str, e: dict) -> dict | None:
 
 
 def table(names: list[str] | None = None):
+    """- Print one line per finished pool run: loss, gap to the control, rounds, wall clock, bytes and staleness.
+        - Globs results/*/metrics.json and keeps rows with "run_config" (pool runs)"""
     b = json.load(open("results/baseline_summary.json")) if os.path.exists("results/baseline_summary.json") else None
     print(f"{'run':<22}{'val':>8}{'vs ctrl':>9}{'rounds':>7}{'wall_s':>8}{'MB':>8}{'stale':>6}  config")
     for mp in sorted(glob.glob("results/*/metrics.json")):
@@ -225,7 +228,8 @@ def table(names: list[str] | None = None):
 
 
 def ledger(path: str = "evals.md"):
-    """Regenerate the eval ledger: every run with its reason, config, result, and verdict vs references."""
+    """- Regenerate evals.md: every run with its reason, config, result, and verdict vs references.
+        - Generated from the same REASONS/SINGLE_RUNS tables the runner launches from"""
     import datetime
     b = json.load(open("results/baseline_summary.json")) if os.path.exists("results/baseline_summary.json") else None
     ctrl = b["val_loss_mean"] if b else None
@@ -254,7 +258,6 @@ def ledger(path: str = "evals.md"):
         vs = f"{100*(m['val_loss']/ctrl-1):+.1f}%" if ctrl else ""
         lines.append(f"| {name} | {m['val_loss']:.4f} | {vs} | {n} | {rc['local_steps']} | {tc['lr']:g} | ({rc['outer_lr']}, {rc['outer_momentum']}) | {rc['shard_mode']}"
                      f" | {m['steps']} | {m['rounds']} | {m['bytes_total']/1e6:.0f} | {m['stale_total']} | {reason} |")
-    # manual runs not in EXPERIMENTS (first two pool runs)
     extra = {"k25_uniform": "First real 4-worker run: K=25, inner lr 1e-3 (control's lr), DiLoCo outer. Missed control by 21%.",
              "k25_lr4e-3": "Retune: inner lr 4e-3 (linear scaling), DiLoCo outer. Closed the batch-size part of the gap.",
              "wan_docker_honeydew": "Real internet: Docker CPU worker + honeydew GPU worker via ngrok, signed auth, adaptive K, contiguous shards. Fast worker did 95% of steps on half the text.",
@@ -275,6 +278,8 @@ def ledger(path: str = "evals.md"):
 
 
 def main():
+    """- Dispatch the CLI: --ledger, --list and --table are read-only; bare names (or "all") run experiments.
+        - A run with an existing metrics.json is skipped unless --force, so "all" is resumable and never overwrites."""
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
     ap.add_argument("--ledger", action="store_true", help="regenerate evals.md")

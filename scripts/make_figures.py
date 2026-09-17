@@ -1,7 +1,6 @@
-"""All loss curves, grouped by the question each group answers. Writes figures/*.png + figures/README.md.
+"""All loss curves, grouped by the question each group answers. python3 scripts/make_figures.py
 
-    python3 scripts/make_figures.py
-"""
+    python3 scripts/make_figures.py"""
 from __future__ import annotations
 
 import json
@@ -19,6 +18,8 @@ CONTROL = json.load(open("results/baseline_summary.json"))
 
 
 def curve(label: str, path: str, final: bool = True):
+    """- Read one run into a (label, tokens, val_loss) series, appending its final loss to the label.
+    - The final number comes from metrics.json, the exact full-validation figure quoted in evals.md."""
     xs, ys, m = read_run(path)
     if final and m and "val_loss" in m:
         label = f"{label} ({m['val_loss']:.3f})"
@@ -28,7 +29,8 @@ def curve(label: str, path: str, final: bool = True):
 
 
 def fig(name: str, title: str, series: list, refs: list = (), control_line: bool = True, ylim=None, note: str = ""):
-    """series: colored curves (<= 6); refs: gray dashed curves (references)."""
+    """- Draw one curve figure: series as coloured curves (<= 6), refs as gray dashed reference curves.
+        - One function for every curve figure, so the set shares axes, control rule and y-padding"""
     assert len(series) <= 6, name
     f, ax = plt.subplots(figsize=(9, 5), facecolor=PAGE)
     style_axes(ax, "training tokens (pool total)", "validation loss (nats/char)")
@@ -134,7 +136,6 @@ index.append((fig("12_text8_10M_model", "text8, 10.7M parameters: equal tokens (
     control_line=False),
     "Different dataset: not comparable to the Shakespeare charts. At 12.3M tokens the 10.7M model is step-limited (sync +30% vs control); the pool sits ~9% above sync. The K=100 wall-clock run was stopped at round 5 of 30."))
 
-# README
 with open(os.path.join(OUT, "README.md"), "w") as f:
     f.write("# Figures\n\nEvery loss curve from the project, grouped by the question each chart answers. All Shakespeare charts share the\n"
             "same axes (validation nats/char vs pool tokens) and the thin line marks the control (1.567). Regenerate with `python3 scripts/make_figures.py`.\n\n")
@@ -148,7 +149,8 @@ BLUES = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#0d366b"]     # sequential
 
 
 def ramp_fig(name, title, groups, ylabel="validation loss (nats/char)", note=""):
-    """groups: list of panels; each panel = (panel_title, [(label, xs, ys)...] ordered light->dark, refs)."""
+    """- Side-by-side panels of series drawn on a single-hue ramp, light to dark.
+    - K and N are ordered, so darker-is-larger lets the colours carry the ordering."""
     n = len(groups)
     f, axes = plt.subplots(1, n, figsize=(9 * n if n == 1 else 6.4 * n, 5), facecolor=PAGE, squeeze=False)
     for ax, (ptitle, series, refs) in zip(axes[0], groups):
@@ -196,7 +198,8 @@ index.append((ramp_fig("14_effect_of_N", "Effect of N (number of workers) at equ
 
 # ============ time and compute cost ============
 def bars_fig(name, title, panels, note=""):
-    """panels: list of (ptitle, ylabel, labels, values, colors, fmt, log)."""
+    """- Draw bar panels of (ptitle, ylabel, labels, values, colors, fmt, log) for the time/cost figures.
+        - "dots" mode is for the loss panel, where a zero-based bar would hide differences of a few percent."""
     f, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 4.6), facecolor=PAGE, squeeze=False)
     for ax, (ptitle, ylabel, labels, values, colors, fmt, log) in zip(axes[0], panels):
         style_axes(ax, "", ylabel)
@@ -227,6 +230,8 @@ def bars_fig(name, title, panels, note=""):
 
 
 def metrics(run):
+    """- Load one run's metrics.json by run name, for the bar panels that need scalars rather than curves.
+        - Raises if the run is missing, unlike plots.read_run: a silently absent bar would misstate a comparison."""
     return json.load(open(f"results/{run}/metrics.json"))
 
 CONTAINER_2CPU_STEPS_PER_S = 3.5      # measured: 2-CPU container, 0.8M model, uniform roster (3.2–3.6 steps/s)

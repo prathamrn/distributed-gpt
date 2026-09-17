@@ -1,6 +1,4 @@
-"""Fault-tolerance paths exercised directly on the Coordinator object (no HTTP, no processes, < 5 s):
-shard hand-out and reuse, oversubscription, rejection of malicious / malformed / stale / unknown deltas,
-liveness bookkeeping, and step-weighted merging of partial deltas."""
+"""Fault-tolerance paths exercised directly on the Coordinator object (no HTTP, no processes"""
 import os
 import pytest
 import torch
@@ -14,14 +12,18 @@ pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(HERE, "data", "t
 
 
 class Clock:
+    """- A callable fake clock the tests advance by hand, monkeypatched over the coordinator's time.time.
+        - Liveness is defined in seconds (a worker silent for dead_after_s is dead)"""
     def __init__(self):
         self.t = 1000.0
     def __call__(self):
+        """- Return the current fake time; tests move it forward by assigning to .t."""
         return self.t
 
 
 @pytest.fixture
 def coord(tmp_path, monkeypatch):
+    """- A real Coordinator on a fake clock, checkpointing into tmp_path, with the round timeout effectively off."""
     clock = Clock()
     import dgpt.coordinator as C
     monkeypatch.setattr(C.time, "time", clock)
@@ -32,27 +34,32 @@ def coord(tmp_path, monkeypatch):
 
 
 def register(c, name):
+    """- Register a worker by name and return the shard it was given, skipping the HTTP layer."""
     return c.register(RegisterRequest(worker_id=name, gpt_config_hash=None)).shard_id
 
 
 def fetch(c, name):
+    """- Fetch the current weights as a worker would and return just the metadata (version and weights hash)."""
     _, meta = unpack(c.weights_body(name, None))
     return meta
 
 
 def send(c, name, meta, delta, n_steps=5):
+    """- Upload a delta the way a worker does: packed tensors plus a DeltaMeta quoting the version it trained from."""
     body = pack(delta, DeltaMeta(worker_id=name, version=meta["version"], weights_hash=meta["weights_hash"], n_steps=n_steps,
                                  n_tokens=n_steps, shard_id=0, round_wall_s=1.0).model_dump(), "float32")
     return c.delta(body)
 
 
 def zeros(c):
+    """- An all-zero delta with the model's exact layout: a well-formed upload that changes nothing."""
     return {k: torch.zeros_like(v) for k, v in c.weights.items()}
 
 
 # ---- shards ---------------------------------------------------------------------------------------
 
 def test_shards_are_handed_out_freed_and_reused(coord):
+    """- A dead worker's shard must be released and handed to the next machine that joins"""
     c = coord
     assert [register(c, w) for w in ("a", "b", "c")] == [0, 1, 2]
     # b dies: its shard is freed and the next joiner gets it
@@ -65,6 +72,7 @@ def test_shards_are_handed_out_freed_and_reused(coord):
 
 
 def test_fourth_worker_shares_the_least_loaded_shard(coord):
+    """- More volunteers than shards is the normal case in an open pool"""
     c = coord
     assert [register(c, w) for w in ("a", "b", "c")] == [0, 1, 2]
     assert register(c, "d") in (0, 1, 2)            # every shard taken: share one
@@ -76,6 +84,7 @@ def test_fourth_worker_shares_the_least_loaded_shard(coord):
 
 
 def test_reregistering_worker_keeps_its_shard_after_coordinator_restart(coord, tmp_path):
+    """- After a resume every shard is unowned, but a returning worker gets its old shard back."""
     c = coord
     register(c, "a"); register(c, "b")
     with c.lock:
@@ -88,6 +97,7 @@ def test_reregistering_worker_keeps_its_shard_after_coordinator_restart(coord, t
 # ---- delta admission ------------------------------------------------------------------------------
 
 def test_malicious_delta_is_rejected_by_the_loss_check(coord):
+    """- With loss_check on, a noise delta that worsens the held-out batch is rejected; an honest one is not."""
     c = coord
     register(c, "evil"); meta = fetch(c, "evil")
     scale = float(torch.cat([v.flatten() for v in c.weights.values()]).std()) * 20
@@ -99,6 +109,7 @@ def test_malicious_delta_is_rejected_by_the_loss_check(coord):
 
 
 def test_wrong_layout_and_unknown_worker_and_stale_are_rejected(coord):
+    """- Wrong tensor layout, unknown worker and stale version each get their own rejection status."""
     c = coord
     register(c, "a"); meta = fetch(c, "a")
     bad = zeros(c); k = next(iter(bad)); bad[k] = torch.zeros(3)
@@ -112,6 +123,7 @@ def test_wrong_layout_and_unknown_worker_and_stale_are_rejected(coord):
 
 
 def test_delta_signed_by_one_worker_but_claiming_another_is_rejected(coord):
+    """- The worker_id inside a delta must match the signer, or the delta is rejected."""
     c = coord
     register(c, "a"); register(c, "b"); meta = fetch(c, "a")
     body = pack(zeros(c), DeltaMeta(worker_id="b", version=meta["version"], weights_hash=meta["weights_hash"], n_steps=5,
@@ -122,6 +134,7 @@ def test_delta_signed_by_one_worker_but_claiming_another_is_rejected(coord):
 # ---- liveness --------------------------------------------------------------------------------------
 
 def test_dead_worker_is_told_to_reregister(coord):
+    """- A worker that was reaped while frozen must learn about it from the heartbeat reply"""
     from dgpt.protocol import HeartbeatRequest
     c = coord
     register(c, "a")
@@ -136,6 +149,7 @@ def test_dead_worker_is_told_to_reregister(coord):
 # ---- merging ---------------------------------------------------------------------------------------
 
 def test_partial_deltas_are_weighted_by_steps(coord):
+    """- Two deltas with 3 and 1 steps merge as a 3:1 weighted average, and global_step advances by 4."""
     c = coord
     register(c, "a"); register(c, "b")
     ma, mb = fetch(c, "a"), fetch(c, "b")

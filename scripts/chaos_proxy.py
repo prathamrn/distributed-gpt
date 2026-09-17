@@ -1,19 +1,8 @@
 """A TCP proxy that sits between one or more workers and the coordinator so a test can break *the connection*
-itself, not the processes: cut it, add latency, or throttle it, per worker, on command.
 
     python3 scripts/chaos_proxy.py --upstream 127.0.0.1:8000 --via w1=8001 --via w2=8002 --control 8100
     python3 -m dgpt.worker --name w1 --coordinator http://127.0.0.1:8001     # w1 talks through the proxy
-
-Control API (plain HTTP GET, so curl works):
-    /set?name=w1&mode=cut          drop every open connection of w1 and refuse new ones (connection reset)
-    /set?name=w1&mode=normal       restore
-    /set?name=w1&lag_ms=800        delay every chunk in both directions by 800 ms (a slow, high-latency link)
-    /set?name=w1&rate_kb_s=200     cap w1's throughput at 200 kB/s (a 43 MB download then takes ~3.5 min)
-    /status                        current mode per worker and live connection counts
-
-Signed requests pass through untouched: the signature covers method, path, timestamp, nonce and body, not the
-host, so the proxy is transparent to the auth layer. scripts/chaos.py drives this with --cut/--lag/--throttle.
-"""
+    /set?name=w1&mode=cut          drop every open connection of w1 and refuse new ones (connection reset)"""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +17,8 @@ CHUNK = 64 * 1024
 
 
 class Link:
-    """State for one worker's port."""
+    """- State for one worker's port: the injected fault settings plus live byte, connection and cut counters.
+    - One Link per worker makes faults selective: break one machine, assert the others merged without it."""
     def __init__(self, name: str, port: int):
         self.name, self.port = name, port
         self.mode = "normal"
@@ -39,17 +29,23 @@ class Link:
         self.cuts = 0
 
     def status(self) -> dict:
+        """- Return this link's current settings and counters as a JSON-serializable dict.
+                - Used as both the /status body and the reply to every /set, so chaos.py (or curl) confirms the fault."""
         return {"port": self.port, "mode": self.mode, "lag_ms": self.lag_ms, "rate_kb_s": self.rate_kb_s,
                 "open_connections": len(self.conns), "bytes_up": self.bytes_up, "bytes_down": self.bytes_down, "cuts": self.cuts}
 
 
 class Proxy:
+    """- The asyncio TCP forwarder: one listening port per worker, all forwarding to the one real coordinator.
+        - Userspace because netem wants NET_ADMIN and firewall rules want root"""
     def __init__(self, upstream: tuple[str, int], links: dict[str, Link]):
         self.upstream, self.links = upstream, links
         self.loop: asyncio.AbstractEventLoop | None = None
 
     # ---- data path -------------------------------------------------------------------------
     async def pump(self, link: Link, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, direction: str):
+        """- Copy one direction of one connection, chunk by chunk, applying the link's current fault settings.
+                - Mode is checked per chunk so a mid-transfer fault takes effect at once"""
         try:
             while True:
                 data = await reader.read(CHUNK)
@@ -76,6 +72,8 @@ class Proxy:
                 pass
 
     async def handle(self, link: Link, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter):
+        """- Accept one worker connection, dial the coordinator, and run both directions until either ends.
+                - A cut link refuses new connections as well as aborting old ones"""
         if link.mode == "cut":
             client_w.close()                     # refuse: the worker sees a reset / connection error
             return
@@ -91,7 +89,8 @@ class Proxy:
             link.conns.discard(client_w); link.conns.discard(up_w)
 
     def cut(self, link: Link):
-        """Close every live connection of this worker (called from the control thread)."""
+        """- Abort every live connection of this worker; called from the control thread.
+        - abort() sends RST, not FIN, so the worker sees a ConnectionError mid-request, as a real tunnel drop does."""
         def _do():
             for w in list(link.conns):
                 try:
@@ -104,6 +103,8 @@ class Proxy:
             self.loop.call_soon_threadsafe(_do)
 
     async def serve(self):
+        """- Bind one listening socket per worker and serve them all forever on this event loop.
+                - Loopback only on purpose: a fault-injection tool should not be reachable from off the machine."""
         self.loop = asyncio.get_running_loop()
         servers = []
         for link in self.links.values():
@@ -116,16 +117,22 @@ class Proxy:
 # ---- control API ---------------------------------------------------------------------------
 
 def control_server(proxy: Proxy, port: int) -> ThreadingHTTPServer:
+    """- Start the localhost control API on its own daemon thread and return the server.
+        - Unauthenticated GET on 127.0.0.1: loopback is the access control, and curl-drivability matters in a demo."""
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
+            """- Silence BaseHTTPRequestHandler's per-request stderr line; this file prints its own state lines."""
             pass
 
         def _json(self, code: int, obj) -> None:
+            """- Write one JSON response with an explicit Content-Length, the only reply shape this API has."""
             body = json.dumps(obj).encode()
             self.send_response(code); self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
         def do_GET(self):
+            """- Handle /status and /set: apply fault settings to one named link and echo its state.
+            - Settings are independent (lag and a rate cap can coexist); only mode=cut acts immediately via Proxy.cut."""
             u = urlparse(self.path); q = {k: v[0] for k, v in parse_qs(u.query).items()}
             if u.path == "/status":
                 return self._json(200, {n: l.status() for n, l in proxy.links.items()})
@@ -153,6 +160,8 @@ def control_server(proxy: Proxy, port: int) -> ThreadingHTTPServer:
 
 
 def main(argv=None):
+    """- Parse --upstream/--via/--control, build the links, start the control API, and run the proxy loop.
+        - Each --via NAME=PORT pairs a listening port with the control API's worker name"""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--upstream", default="127.0.0.1:8000", help="the real coordinator host:port")
     ap.add_argument("--via", action="append", default=[], metavar="NAME=PORT", required=True,

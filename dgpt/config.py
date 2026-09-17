@@ -1,9 +1,4 @@
-"""Single source of truth for the training recipe.
-
-The baseline (control) and every distributed run must use the same model and
-the same total token budget so loss curves are comparable at equal tokens
-(PRD success criterion 1). Change numbers here, nowhere else.
-"""
+"""Single source of truth for the training recipe."""
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -13,6 +8,8 @@ from dgpt.model import GPTConfig
 
 @dataclass
 class TrainConfig:
+    """- The training recipe, shared by the control and by every worker's local steps.
+        - The coordinator publishes this at /register so a volunteer never carries its own copy"""
     # data
     dataset: str = "tinyshakespeare"   # tinyshakespeare | text8 (see data.DATASETS); vocab_size follows the dataset
     # model
@@ -39,19 +36,26 @@ class TrainConfig:
 
     @property
     def tokens_per_step(self) -> int:
+        """- Tokens consumed by one optimizer step, derived rather than typed so it cannot disagree with reality.
+                - This is the unit of the x-axis on every loss figure and of the equal-tokens claim itself."""
         return self.batch_size * self.block_size
 
     @property
     def total_tokens(self) -> int:
+        """- The whole run's token budget, and the quantity the control and any pool run are matched on."""
         return self.max_steps * self.tokens_per_step
 
     def model_config(self) -> GPTConfig:
+        """- Project the model fields of the recipe into the GPTConfig that builds the network.
+        - The coordinator builds its model from this and publishes the dict at /register so workers build the same one."""
         return GPTConfig(
             vocab_size=self.vocab_size, block_size=self.block_size, n_layer=self.n_layer,
             n_head=self.n_head, n_embd=self.n_embd, dropout=self.dropout,
         )
 
     def to_dict(self) -> dict:
+        """- Serialize the settings; /register hands this to every worker and it lands in metrics.json.
+        - Computed properties are added explicitly because asdict only sees declared fields."""
         d = asdict(self)
         d["tokens_per_step"] = self.tokens_per_step
         d["total_tokens"] = self.total_tokens
@@ -59,8 +63,9 @@ class TrainConfig:
 
 
 def lr_at(step: int, cfg: TrainConfig) -> float:
-    """Linear warmup then cosine decay to min_lr, keyed on the *global* step so
-    workers in the distributed run can reproduce the same schedule."""
+    """- Linear warmup then cosine decay to min_lr, keyed on the global step, not the worker's own step.
+    - Every worker on the same schedule regardless of its K; the worker evaluates it at global_step + i * n_alive.
+    - Called per step by baseline.py and by Worker.train_round."""
     import math
     if step < cfg.warmup_steps:
         return cfg.lr * (step + 1) / cfg.warmup_steps
@@ -72,8 +77,9 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
 
 @dataclass
 class RunConfig:
-    """Knobs for one distributed run. The coordinator owns this and hands it to
-    workers at registration. Edit here or override with --set key=value."""
+    """- Knobs for one distributed run; the coordinator owns it and hands it to workers at registration.
+    - Every field is pushed to workers, so changing the mechanism is a coordinator flag, never a worker redeploy.
+    - Override with --set key=value; serialized into ckpt.pt and metrics.json."""
     run_name: str = "run"
     # local SGD
     local_steps: int = 25            # K: steps a worker trains alone between syncs
@@ -111,8 +117,12 @@ class RunConfig:
     seed: int = 1337
 
     def to_dict(self) -> dict:
+        """- Serialize the settings; /register hands this to every worker and it lands in metrics.json.
+        - Computed properties are added explicitly because asdict only sees declared fields."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "RunConfig":
+        """- Rebuild a RunConfig from a serialized one, ignoring keys this version does not know.
+        - The filter is what lets an older checkpoint or a slightly older worker still load the config."""
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

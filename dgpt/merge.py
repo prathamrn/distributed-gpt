@@ -1,8 +1,4 @@
-"""Pure functions for the coordinator: aggregation, outer optimizer, round rule.
-
-No I/O, no FastAPI, no globals. Everything here is unit-tested in tests/.
-State dicts are plain {name: float32 tensor} mappings.
-"""
+"""Pure functions for the coordinator: aggregation, outer optimizer, round rule."""
 from __future__ import annotations
 
 import statistics
@@ -16,7 +12,9 @@ StateDict = dict[str, torch.Tensor]
 # ---- aggregation -------------------------------------------------------------
 
 def weighted_average(deltas: list[StateDict], weights: list[float]) -> StateDict:
-    """Sum_i w_i * delta_i / Sum_i w_i, computed in float32."""
+    """- Sum_i w_i*delta_i / Sum_i w_i in float32; the default aggregation rule.
+        - w_i is the step count, so 490 steps counts ~4.5x 110 steps and a straggler's partial still contributes.
+        - fp32 accumulation keeps a bf16 pool coherent; called by aggregate(), feeds OuterOptimizer.step."""
     assert deltas and len(deltas) == len(weights)
     total = float(sum(weights))
     assert total > 0, "weights must sum to > 0"
@@ -30,12 +28,16 @@ def weighted_average(deltas: list[StateDict], weights: list[float]) -> StateDict
 
 
 def coordinate_median(deltas: list[StateDict]) -> StateDict:
-    """Coordinate-wise median. One outlier cannot move it (PRD 7.11)."""
+    """- Coordinate-wise median of the deltas: a minority sending garbage cannot move it (PRD 7.11).
+        - Selected with --set aggregation=median; it discards the step weights, so it discounts the busiest worker.
+        - Reached through aggregate(); robustness here is a policy choice, not a free upgrade over the mean."""
     return {k: torch.stack([d[k].to(torch.float32) for d in deltas]).median(dim=0).values for k in deltas[0]}
 
 
 def trimmed_mean(deltas: list[StateDict], trim_fraction: float = 0.1) -> StateDict:
-    """Coordinate-wise mean after dropping the top and bottom `trim_fraction` of values."""
+    """- Coordinate-wise mean after dropping int(n*trim_fraction) values at each end; --set aggregation=trimmed.
+        - The middle ground between mean and median: resists a few bad deltas, still ignores the step weights.
+        - Falls back to the full mean when trimming would remove everything; reached through aggregate()."""
     n = len(deltas)
     k = int(n * trim_fraction)
     out: StateDict = {}
@@ -46,6 +48,9 @@ def trimmed_mean(deltas: list[StateDict], trim_fraction: float = 0.1) -> StateDi
 
 
 def aggregate(deltas: list[StateDict], weights: list[float], method: str = "mean", trim_fraction: float = 0.1) -> StateDict:
+    """- Dispatch to the rule named by RunConfig.aggregation; the coordinator's one entry point into this file.
+        - One name behind three rules makes trusting-vs-robust a one-flag experiment; an unknown name raises here.
+        - Called from Coordinator._merge; the returned delta goes straight into OuterOptimizer.step."""
     if method == "mean":
         return weighted_average(deltas, weights)
     if method == "median":
@@ -59,17 +64,18 @@ def aggregate(deltas: list[StateDict], weights: list[float], method: str = "mean
 
 @dataclass
 class OuterOptimizer:
-    """W_{t+1} = W_t - lr * step, where the averaged delta plays the role of a gradient.
-
-    momentum=0, lr=1 with a single worker reproduces that worker's local weights
-    exactly (tested). Nesterov: v = mu*v + g ; step = g + mu*v. Plain: step = v.
-    """
+    """- W_{t+1} = W_t - lr*step, with the averaged delta playing the role of a gradient (DiLoCo's outer SGD).
+        - Nesterov: v = mu*v + g, step = g + mu*v; plain: step = v. lr 1, momentum 0, one worker => its weights.
+        - RunConfig defaults to plain averaging: DiLoCo's (0.7, 0.9) lost at every K (R6: 1.783 vs 1.721 at K=25)."""
     lr: float = 0.7
     momentum: float = 0.9
     nesterov: bool = True
     buf: StateDict = field(default_factory=dict)
 
     def step(self, weights: StateDict, avg_delta: StateDict) -> StateDict:
+        """- Apply one outer step; returns the next version's weights, which the coordinator hashes and serves.
+                - Computed in float32 and out of place, so a crash mid-merge cannot leave a half-updated model.
+                - With momentum 0 the velocity branch is skipped and the step is the averaged delta (the default)."""
         new: StateDict = {}
         for k, w in weights.items():
             g = avg_delta[k].to(torch.float32)
@@ -84,16 +90,23 @@ class OuterOptimizer:
         return new
 
     def state_dict(self) -> dict:
+        """- Everything needed to resume the outer optimizer; goes into results/<run>/ckpt.pt.
+                - The buffer is cloned so a later step cannot mutate the saved copy.
+                - The coordinator auto-resumes after a crash; forgetting the velocity would change the trajectory."""
         return {"lr": self.lr, "momentum": self.momentum, "nesterov": self.nesterov,
                 "buf": {k: v.clone() for k, v in self.buf.items()}}
 
     def load_state_dict(self, d: dict) -> None:
+        """- Inverse of state_dict, used when the coordinator resumes a run from ckpt.pt.
+                - The outer hyperparameters come from the checkpoint too, so a resumed run keeps its original settings."""
         self.lr, self.momentum, self.nesterov = d["lr"], d["momentum"], d["nesterov"]
         self.buf = {k: v.clone() for k, v in d["buf"].items()}
 
 
 def delta_of(start: StateDict, local: StateDict) -> StateDict:
-    """delta = W_start - W_local (gradient sign convention)."""
+    """- delta = W_start - W_local (gradient sign convention), in float32.
+        - The worker calls this at the end of a round and packs the result into POST /delta.
+        - This sign lets the average feed a standard subtract-lr-times-g rule unchanged (the anchor invariant)."""
     return {k: start[k].to(torch.float32) - local[k].to(torch.float32) for k in start}
 
 
@@ -101,7 +114,9 @@ def delta_of(start: StateDict, local: StateDict) -> StateDict:
 
 @dataclass
 class RoundView:
-    """Everything the closing rule needs, with no reference to live state."""
+    """- Snapshot of everything should_close_round needs, with no reference to live server state.
+        - Built under the coordinator's lock each 250 ms tick, so every closing case is testable without FastAPI.
+        - `alive` means heartbeating, not "fetched the current version"."""
     alive: set[str]               # registered workers with a recent heartbeat
     reported: set[str]            # workers whose delta was accepted this round
     elapsed_s: float              # since the round opened
@@ -110,10 +125,9 @@ class RoundView:
 
 
 def should_close_round(v: RoundView) -> tuple[bool, str]:
-    """PRD 7.6/7.9: close when every alive worker reported, or on timeout with >= min_workers.
-    A worker still training an older version is alive and NOT reported, so the round
-    waits for it until the timeout; the heartbeat tells it the deadline so it can upload
-    a partial delta in time. Never closes with zero deltas."""
+    """- Close when every alive worker reported, or on timeout with >= min_workers (PRD 7.6/7.9); never on zero.
+        - Waits on liveness, not participation: waiting on fetchers alone let one worker close every round (R2).
+        - Returns (close?, reason); the reason lands in the merge row of the run's JSONL log."""
     if not v.reported:
         return False, "no deltas yet"
     waiting_on = v.alive - v.reported
@@ -125,7 +139,9 @@ def should_close_round(v: RoundView) -> tuple[bool, str]:
 
 
 def round_timeout(recent_round_times: list[float], factor: float, floor_s: float, initial_s: float) -> float:
-    """factor * median of recent full-round durations, with a floor; `initial_s` until there is history."""
+    """- factor * median of recent full-cycle (download+train+upload) times, floored; initial_s until history.
+        - Median not mean: the 100x-off worker is exactly what this bounds, and a mean would be dragged by it.
+        - Recomputed each manager tick and sent as round_closes_in_s; whole cycles, not train time, after R16."""
     if len(recent_round_times) < 2:
         return initial_s
     return max(floor_s, factor * statistics.median(recent_round_times))
@@ -133,17 +149,9 @@ def round_timeout(recent_round_times: list[float], factor: float, floor_s: float
 
 def adaptive_local_steps(base_k: int, worker_steps_per_s: dict[str, float], worker_id: str, k_min: int = 1,
                          overhead_s: dict[str, float] | None = None, min_frac: float = 0.1) -> int:
-    """Steps for one worker this round, chosen so every worker's *cycle* (download + train + upload) lands on the
-    same target (PRD 7.9 straggler adaptation, made transfer-aware).
-
-    train_target = base_k / median_speed          seconds the median worker spends training K steps
-    cycle_target = train_target + median_overhead the median worker's whole cycle
-    budget_i     = cycle_target - overhead_i      training time left for worker i after its own transfers
-    K_i          = speed_i * budget_i
-
-    With zero overhead this is the PRD formula K * speed_i / median_speed. A worker whose transfers eat the
-    whole budget still gets `min_frac` of the training target so it keeps contributing (and keeps being measured)
-    instead of being cut to one step and arriving stale. Workers without a measured speed get base_k."""
+    """- Steps for one worker this round, sized so every worker's whole cycle hits the same target (PRD 7.9).
+        - budget_i = base_k/median_speed + median_overhead - overhead_i; K_i = round(speed_i*budget_i) >= k_min.
+        - Called from GET /weights when adaptive_k is on; transfer-aware after R16; no measured speed => base_k."""
     speeds = [s for s in worker_steps_per_s.values() if s and s > 0]
     mine = worker_steps_per_s.get(worker_id)
     if not speeds or not mine or mine <= 0:

@@ -1,9 +1,6 @@
-"""Evaluate a checkpoint on the held-out TEST region of a dataset: the last 5M characters of the val split, which
-no training or validation pass ever reads (Dataset.load keeps only the first VAL_MAX_CHARS of val.bin).
-Works for coordinator checkpoints (results/<run>/ckpt.pt, key "weights") and baseline ones (key "model").
+"""Evaluate a checkpoint on the held-out TEST region: the last 5M chars of val
 
-    python3 scripts/test_eval.py results/fil9_full/ckpt.pt [--device mps]
-"""
+    python3 scripts/test_eval.py results/fil9_full/ckpt.pt [--device mps]"""
 import argparse
 import dataclasses
 import json
@@ -22,6 +19,8 @@ TEST_CHARS = 5_000_000
 
 
 def main():
+    """- Score one checkpoint on the untouched test region and write test_metrics.json beside it.
+    - Output feeds scripts/summarize_pool.py's test column and the "Test (last 5M)" evals.md figures."""
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))

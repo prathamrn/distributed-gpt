@@ -1,7 +1,6 @@
-"""Aggregate metrics.json files from a set of runs into one table + JSON.
+"""Aggregate metrics.json files from a set of runs into one table + JSON. python3 scripts/summarize.py python3
 
-  python3 scripts/summarize.py results/baseline*          # prints a table, writes results/baseline_summary.json
-"""
+  python3 scripts/summarize.py results/baseline*          # prints a table, writes results/baseline_summary.json"""
 from __future__ import annotations
 
 import glob
@@ -12,6 +11,8 @@ import sys
 
 
 def load_runs(patterns: list[str]) -> list[dict]:
+    """- Load metrics.json for every run directory matching the glob patterns.
+    - Directories without metrics.json are skipped, so an unfinished run never counts as a seed."""
     runs = []
     for pat in patterns:
         for d in sorted(glob.glob(pat)):
@@ -25,6 +26,7 @@ def load_runs(patterns: list[str]) -> list[dict]:
 
 
 def mean_std(xs: list[float]) -> tuple[float, float]:
+    """- Mean and sample standard deviation (n-1) of xs; std 0.0 for a single value."""
     n = len(xs)
     mu = sum(xs) / n
     sd = math.sqrt(sum((x - mu) ** 2 for x in xs) / (n - 1)) if n > 1 else 0.0
@@ -32,6 +34,8 @@ def mean_std(xs: list[float]) -> tuple[float, float]:
 
 
 def main():
+    """- Print the per-seed table and write results/baseline_summary.json, the control every run is judged against.
+        - Default pattern averages every baseline* directory into one mean"""
     pats = sys.argv[1:] or ["results/baseline*"]
     runs = load_runs(pats)
     if not runs:

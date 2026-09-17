@@ -1,13 +1,7 @@
 """Turn JSONL training logs into figures (PRD 9, 11).
 
-Usage:
   python3 scripts/plots.py baseline                 # control figure from results/baseline*/log.jsonl
-  python3 scripts/plots.py curves A=path/a.jsonl B=path/b.jsonl --out results/x.png --title "..."
-
-Style follows the dataviz reference palette: categorical hues in fixed slot
-order, 2px lines, hairline solid gridlines, text in ink tokens (never the
-series color), a legend plus sparing direct end-labels.
-"""
+  python3 scripts/plots.py curves A=path/a.jsonl B=path/b.jsonl --out results/x.png --title "..." """
 from __future__ import annotations
 
 import argparse
@@ -65,7 +59,8 @@ def millions(x, _):
 
 
 def plot_curves(ax, series: list[tuple[str, list[float], list[float]]], end_labels: bool = True):
-    """series: list of (label, xs, ys). Hue follows list order (fixed slots)."""
+    """- series: list of (label, xs, ys).
+    - Hue follows list order (fixed slots)."""
     for i, (label, xs, ys) in enumerate(series):
         c = SERIES[i % len(SERIES)]
         ax.plot(xs, ys, color=c, linewidth=2, solid_joinstyle="round", solid_capstyle="round", label=label, zorder=3)
@@ -99,8 +94,7 @@ def plot_curves(ax, series: list[tuple[str, list[float], list[float]]], end_labe
 
 
 def fig_baseline(out_png: str):
-    """Control figure: val loss vs tokens for every baseline seed, plus the
-    train/val gap for the primary seed."""
+    """- Control figure: val loss vs tokens for every baseline seed, plus the train/val gap for the primary seed."""
     runs = {}
     for d in sorted(glob.glob("results/baseline*")):
         lp = os.path.join(d, "log.jsonl")
@@ -173,7 +167,7 @@ def fig_curves(specs: list[str], out_png: str, title: str, ykey: str = "val_loss
 
 
 def read_run(path_or_dir: str) -> tuple[list[float], list[float], dict | None]:
-    """(tokens, val_loss, metrics) for either a baseline dir/log.jsonl or a distributed dir/coordinator.jsonl."""
+    """- (tokens, val_loss, metrics) for either a baseline dir/log.jsonl or a distributed dir/coordinator.jsonl."""
     d = path_or_dir if os.path.isdir(path_or_dir) else os.path.dirname(path_or_dir)
     metrics = None
     mp = os.path.join(d, "metrics.json")
@@ -189,7 +183,7 @@ def read_run(path_or_dir: str) -> tuple[list[float], list[float], dict | None]:
 
 
 def fig_compare(specs: list[str], out_png: str, title: str, baseline_band: str | None = None):
-    """Distributed runs vs baseline, val loss vs tokens. specs: label=results/<run>."""
+    """- Distributed runs vs baseline, val loss vs tokens. specs: label=results/<run>."""
     series = []
     for spec in specs:
         label, path = spec.rsplit("=", 1)
@@ -219,8 +213,7 @@ def fig_compare(specs: list[str], out_png: str, title: str, baseline_band: str |
 
 
 def fig_sweep(specs: list[str], out_png: str, title: str, refs: list[str], baseline_band: str | None = None):
-    """Headline figure: left = val loss vs tokens, one line per K (plus reference runs in gray);
-    right = bytes moved per run, one bar per K, with the K=1 theoretical bar. specs: 'K=25=results/run'."""
+    """- Headline figure: left = val loss vs tokens, one line per K (plus reference runs in gray)"""
     series, bars = [], []
     for spec in specs:
         label, path = spec.rsplit("=", 1)
@@ -275,8 +268,7 @@ def fig_sweep(specs: list[str], out_png: str, title: str, refs: list[str], basel
 
 
 def fig_nodes(specs: list[str], out_png: str, title: str, control: str | None = "results/baseline_summary.json"):
-    """Worker-count figure: final val loss vs N for the pool and for its synchronous reference at the same
-    tokens. specs: 'N=<n>:pool=<dir>:sync=<dir>' (sync optional)."""
+    """- Worker-count figure: final val loss vs N for the pool and for its synchronous reference at the same tokens."""
     ns, pool, sync = [], [], []
     for spec in specs:
         parts = dict(kv.split("=", 1) for kv in spec.split(":"))

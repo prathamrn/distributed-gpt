@@ -1,11 +1,4 @@
-"""Character-level data pipeline for Tiny Shakespeare.
-
-- `prepare()` tokenizes input.txt once into train.bin / val.bin (uint16) + meta.json.
-- `Dataset` loads those and serves random training batches or a deterministic
-  full pass over the validation split.
-- Sharding for the distributed runs (PRD 7.8) lives here too so the baseline
-  and workers share one tokenization.
-"""
+"""Character-level data pipeline for Tiny Shakespeare. - `prepare()` tokenizes input.txt once into train.bin /"""
 from __future__ import annotations
 
 import json
@@ -33,6 +26,8 @@ VAL_MAX_CHARS = 500_000        # per-round eval must stay ~1 s: score a fixed pr
 
 
 def _paths(name: str) -> dict:
+    """- Every file belonging to one dataset, resolved under ROOT; the single place the layout is decided.
+    - An unknown name raises immediately with the list of valid datasets."""
     if name not in DATASETS:
         raise ValueError(f"unknown dataset {name!r}; known: {sorted(DATASETS)}")
     d = os.path.join(ROOT, name)
@@ -49,24 +44,32 @@ META_PATH = _paths(DEFAULT_DATASET)["meta"]
 
 
 class CharTokenizer:
+    """- Character-level vocabulary: one id per distinct character, no BPE, nothing to train or distribute.
+    - Vocab 65 on Shakespeare, 27 on text8/fil9; the coordinator's TrainConfig.vocab_size is set from it."""
+
     def __init__(self, chars: list[str]):
+        """- Build both directions of the mapping from the ordered chars list stored in the dataset's meta.json."""
         self.chars = chars
         self.stoi = {ch: i for i, ch in enumerate(chars)}
         self.itos = {i: ch for i, ch in enumerate(chars)}
 
     @property
     def vocab_size(self) -> int:
+        """- Shortcut to the tokenizer's vocabulary size; callers set TrainConfig.vocab_size from it before building the model."""
         return len(self.chars)
 
     def encode(self, s: str) -> list[int]:
+        """- Text to ids, one per character; used for short strings such as a sampling prompt."""
         return [self.stoi[c] for c in s]
 
     def decode(self, ids) -> str:
+        """- Ids back to text, for printing generated samples in evaluate.py."""
         return "".join(self.itos[int(i)] for i in ids)
 
 
 def prepare(name: str = DEFAULT_DATASET, force: bool = False) -> dict:
-    """Tokenize the raw text once. Split is a contiguous cut (90/10), as in nanoGPT."""
+    """- Tokenize the raw text once.
+        - Split is a contiguous cut (90/10), as in nanoGPT."""
     p = _paths(name)
     if not force and all(os.path.exists(p[k]) for k in ("train", "val", "meta")):
         with open(p["meta"]) as f:
@@ -100,7 +103,8 @@ def prepare(name: str = DEFAULT_DATASET, force: bool = False) -> dict:
 
 
 def ensure_dataset(name: str, fetch_from: str | None = None, progress=print, headers=None) -> None:
-    """`headers` may be a dict or a callable (method, url) -> dict (for per-request signatures)."""
+    """- Get the dataset onto this machine, by download from the coordinator or by tokenizing a local raw file.
+    - This is what lets a volunteer start with nothing but the coordinator's URL; called from Dataset.load."""
     """Make the tokenized files for `name` exist locally. If missing and `fetch_from` (a coordinator URL)
     is given, download them from GET {fetch_from}/data/{name}/{file}. Falls back to tokenizing a local raw file."""
     p = _paths(name)
@@ -130,6 +134,8 @@ def ensure_dataset(name: str, fetch_from: str | None = None, progress=print, hea
 
 @dataclass
 class Dataset:
+    """- The loaded corpus: a train array, a capped validation array, and the tokenizer that produced them.
+        - Every consumer of data in the project holds one of these - the control, each worker"""
     train: np.ndarray
     val: np.ndarray
     tokenizer: CharTokenizer
@@ -137,6 +143,9 @@ class Dataset:
 
     @classmethod
     def load(cls, name: str = DEFAULT_DATASET, fetch_from: str | None = None, headers=None) -> "Dataset":
+        """- Fetch-or-tokenize, then open both splits; the one constructor every caller uses.
+        - The train split is memory-mapped (fil9's is 1.8 GB) and val is cut to VAL_MAX_CHARS so every eval is identical.
+        - Called by the coordinator, every worker, baseline.py and the eval scripts."""
         ensure_dataset(name, fetch_from, headers=headers)
         meta = prepare(name)
         p = _paths(name)
@@ -147,13 +156,18 @@ class Dataset:
 
     @property
     def vocab_size(self) -> int:
+        """- Shortcut to the tokenizer's vocabulary size; callers set TrainConfig.vocab_size from it before building the model."""
         return self.tokenizer.vocab_size
 
     def _split(self, split: str) -> np.ndarray:
+        """- Pick the array for a split name.
+                - Anything that is not "train" is treated as validation."""
         return self.train if split == "train" else self.val
 
     def get_batch(self, split: str, batch_size: int, block_size: int, rng: np.random.Generator, device: str = "cpu"):
-        """Random contiguous windows, nanoGPT-style. Seeded via `rng` for reproducibility."""
+        """- Random contiguous windows, nanoGPT-style, from the given split.
+        - Independent random offsets per step rather than a sequential cursor, so consecutive batches are not correlated.
+        - Used by baseline.py for training/quick-eval and by the coordinator for its held-out loss-check batch."""
         d = self._split(split)
         ix = rng.integers(0, len(d) - block_size - 1, size=batch_size)
         x = torch.stack([torch.from_numpy(d[i:i + block_size].astype(np.int64)) for i in ix])
@@ -161,9 +175,8 @@ class Dataset:
         return x.to(device), y.to(device)
 
     def iter_val_full(self, batch_size: int, block_size: int, device: str = "cpu"):
-        """Deterministic single pass over the whole validation split in
-        non-overlapping windows. Every eval sees exactly the same tokens, so
-        numbers are comparable across runs and across machines."""
+        """- Deterministic single pass over the whole (capped) validation split in non-overlapping windows.
+        - No sampling and no seed, so two evals differ only if the weights do; used by evaluate_full."""
         d = self.val
         n_windows = (len(d) - 1) // block_size
         xs = np.stack([d[i * block_size:(i + 1) * block_size] for i in range(n_windows)]).astype(np.int64)
@@ -175,13 +188,15 @@ class Dataset:
 
     # ---- sharding (PRD 7.8); used by workers in later steps -----------------
     def shard_bounds(self, n_shards: int) -> list[tuple[int, int]]:
+        """- Equal contiguous [lo, hi) ranges over the training split, one per shard.
+        - Used by Worker.batch in contiguous mode to decide where this worker's windows may start."""
         n = len(self.train)
         edges = np.linspace(0, n, n_shards + 1, dtype=np.int64)
         return [(int(edges[i]), int(edges[i + 1])) for i in range(n_shards)]
 
     def get_shard_batch(self, shard_id: int, n_shards: int, offset: int, batch_size: int, block_size: int, device: str = "cpu"):
-        """Sequential batches from one shard, wrapping at the shard end.
-        Returns (x, y, new_offset)."""
+        """- Sequential batches from one shard, wrapping at the shard end.
+        - The PRD's original cursor sampler; currently unused (workers draw random offsets instead)."""
         lo, hi = self.shard_bounds(n_shards)[shard_id]
         d = self.train
         span = hi - lo

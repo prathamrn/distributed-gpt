@@ -1,4 +1,4 @@
-"""A second instance registering with the same worker id supersedes the first: the old session gets 409."""
+"""Protects the one-token-one-instance rule: a second registration under the same worker id supersedes the"""
 import os
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +11,7 @@ pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(HERE, "data", "t
 
 
 def test_newer_instance_supersedes_older(tmp_path):
+    """- Catches a zombie instance keeping its slot alive or starting another round after being superseded."""
     coord = Coordinator(RunConfig(run_name="fence_test", checkpoint_dir=str(tmp_path), total_steps=10, local_steps=2, n_shards=1), TrainConfig())
     app = build_app(coord)
     with TestClient(app) as c:
